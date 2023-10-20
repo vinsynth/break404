@@ -2,13 +2,24 @@
 #![no_main]
 
 use defmt::*;
+use defmt::panic;
 use defmt_rtt as _;
 
+use hal::dma::SingleChannel;
 use panic_halt as _;
 
 use rp2040_hal as hal;
 
 use hal::clocks::{Clock, ClocksManager};
+use hal::gpio::{
+    DynPinId,
+    FunctionSioInput,
+    FunctionSpi,
+    Pin,
+    PullDown,
+    PullNone,
+    PullUp,
+};
 use hal::pll::common_configs::PLL_USB_48MHZ;
 use hal::pll::PLLConfig;
 use hal::pwm;
@@ -16,36 +27,37 @@ use hal::pwm;
 use hal::pac;
 use pac::interrupt;
 
-use embedded_hal::blocking::delay::DelayMs;
-use embedded_hal::digital::v2::{InputPin, OutputPin};
+use embedded_hal::digital::v2::InputPin;
 use embedded_hal::PwmPin;
 
-use core::cell::RefCell;
+use embedded_sdmmc::{
+    SdCard,
+    TimeSource,
+    Timestamp,
+    VolumeIdx,
+    VolumeManager,
+};
+use embedded_sdmmc::filesystem;
+
+use core::cell::{Cell, RefCell};
 use critical_section::Mutex;
 
 use fugit::{HertzU32, RateExtU32};
-use byteorder::{ByteOrder, LittleEndian};
 
-fn blink_binary(
-    pin: &mut dyn embedded_hal::digital::v2::OutputPin<Error = core::convert::Infallible>,
-    delay: &mut dyn DelayMs<u32>,
-    val: u32,
-) {
-    delay.delay_ms(1200);
-    for b in (0..=31).rev() {
-        if (val & (1 << b)) >> b == 1 {
-            pin.set_high().unwrap();
-            delay.delay_ms(1000);
-            pin.set_low().unwrap();
-            delay.delay_ms(200);
-        } else {
-            pin.set_high().unwrap();
-            delay.delay_ms(200);
-            pin.set_low().unwrap();
-            delay.delay_ms(1000);
+#[derive(Default)]
+pub struct DummyTimesource();
+
+impl TimeSource for DummyTimesource {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+            year_since_1970: 0,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
         }
     }
-    delay.delay_ms(1200);
 }
 
 #[link_section = ".boot2"]
@@ -65,12 +77,32 @@ type PwmOut = pwm::Slice<pwm::Pwm0, pwm::FreeRunning>;
 static PWMOUT: Mutex<RefCell<Option<PwmOut>>> = Mutex::new(RefCell::new(None));
 
 static BREAK_BYTES: &[u8] = include_bytes!("../assets/lc8.wav");
+static AUDIO: Mutex<RefCell<Option<core::iter::Cycle<core::slice::Iter<'_, u8>>>>> =
+    Mutex::new(RefCell::new(None));
+// static STREAM: Mutex<Option<core::iter::Cycle<core::iter::Iterator::Iter<(dyn Iterator + 'static), u8>>>> = Mutex::new(None);
+
+static FREE_CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
+static RETRIG_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
+
+static CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
+
+extern crate alloc;
+use alloc::vec::Vec;
+use embedded_alloc::Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
 
 #[rp2040_hal::entry]
 fn main() -> ! {
-    // let mut lc = [0; BREAK_BYTES.len() / 2 - 0x2c];
-    // LittleEndian::read_u16_into(&BREAK_BYTES[0x2c..], &mut lc);
-    info!("program start!");
+    // init allocator
+    info!("init allocator...");
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 0x1000;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+    }
 
     // init clocks
     info!("init clocks...");
@@ -100,10 +132,10 @@ fn main() -> ! {
         &mut pac.RESETS,
     )
     .unwrap();
-
     clocks
         .init_default(&xosc, &pll_sys, &pll_usb)
         .unwrap();
+
     let mut delay = cortex_m::delay::Delay::new(
         core.SYST, clocks.system_clock.freq().to_Hz()
     );
@@ -111,7 +143,6 @@ fn main() -> ! {
     info!("sysclk freq: {} Hz", clocks.system_clock.freq().to_Hz());
 
     // init pins
-    info!("init pins...");
     let sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
@@ -119,7 +150,91 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-    let mut led_pin = pins.gpio25.into_push_pull_output();
+
+    // init spi pins
+    info!("init spi pins...");
+    let spi_sclk: Pin<_, FunctionSpi, PullNone> = pins.gpio10.reconfigure();
+    let spi_mosi: Pin<_, FunctionSpi, PullNone> = pins.gpio11.reconfigure();
+    let spi_miso: Pin<_, FunctionSpi, PullUp> = pins.gpio12.reconfigure();
+    let spi_cs = pins.gpio13.into_push_pull_output();
+
+    let spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI1, (spi_mosi, spi_miso, spi_sclk));
+
+    let spi = spi.init(
+        &mut pac.RESETS,
+        clocks.peripheral_clock.freq(),
+        400.kHz(),
+        embedded_hal::spi::MODE_0,
+    );
+
+    let sdcard = SdCard::new(spi, spi_cs, delay);
+    let mut vol_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
+
+    match vol_mgr.device().num_bytes() {
+        Ok(size) => info!("card size is {} bytes", size),
+        Err(e) => panic!("error retrieving card size: {}", Debug2Format(&e)),
+    }
+
+    vol_mgr
+        .device()
+        .spi(|spi| spi.set_baudrate(clocks.peripheral_clock.freq(), 16.MHz()));
+
+    let mut vol0 = match vol_mgr.get_volume(VolumeIdx(0)) {
+        Ok(v) => v,
+        Err(e) => panic!("error getting volume 0: {}", Debug2Format(&e)),
+    };
+    let root = match vol_mgr.open_root_dir(&vol0) {
+        Ok(dir) => dir,
+        Err(e) => panic!("error opening root directory: {}", Debug2Format(&e)),
+    };
+
+    let mut dirs = Vec::new();
+    vol_mgr
+        .iterate_dir(&vol0, &root, |ent| {
+            if ent.attributes.is_directory() {
+                dirs.push(
+                    alloc::string::String::from_utf8(
+                        ent.name.base_name().to_vec()
+                    ).unwrap()
+                );
+            }
+        })
+        .ok();
+    let dir_set0 = match vol_mgr.open_dir(&vol0, &root, "set0") {
+        Ok(dir) => dir,
+        Err(e) => panic!("error opening `set0` directory: {}", Debug2Format(&e)),
+    };
+
+    vol_mgr
+        .iterate_dir(&vol0, &dir_set0, |ent| {
+            info!(
+                "/{}.{}",
+                core::str::from_utf8(ent.name.base_name()).unwrap(),
+                core::str::from_utf8(ent.name.extension()).unwrap()
+            );
+        })
+        .ok();
+    if let Ok(mut file) = vol_mgr.open_file_in_dir(&mut vol0, &dir_set0, "lc8.wav", filesystem::Mode::ReadOnly) {
+        let mut buf = [0u8; 32];
+        // critical_section::with(|cs| {
+        //     let buf = fixed_slice_vec::FixedSliceVec::new();
+        //     if let Ok(mut audio) = AUDIO.borrow(cs).try_borrow_mut() {
+        //         vol_mgr.read(&vol0, &mut file, &mut AUDIO).iter().cycle();
+        //     }
+        // });
+        let read_count = vol_mgr.read(&vol0, &mut file, &mut buf).unwrap();
+        vol_mgr.close_file(&vol0, file).unwrap();
+
+        info!("read {} bytes: {}", read_count, buf);
+    }
+    vol_mgr.free();
+
+    // init AUDIO
+    critical_section::with(|cs| {
+        if let Ok(mut audio) = AUDIO.borrow(cs).try_borrow_mut() {
+            audio.replace(BREAK_BYTES.iter().cycle());
+        }
+    });
 
     // init pwm
     info!("init pwm...");
@@ -135,7 +250,8 @@ fn main() -> ! {
 
     info!(
         "pwm freq: {} Hz",
-        clocks.system_clock.freq().to_Hz() / ((pwm.get_top() as u32 + 1) * (0 + 1) * (1 + (0 / 16)))
+        clocks.system_clock.freq().to_Hz() /
+            ((pwm.get_top() as u32 + 1) * (0 + 1) * (1 + (0 / 16)))
     );
 
     pwm.channel_a.output_to(pins.gpio16); // left channel
@@ -146,19 +262,119 @@ fn main() -> ! {
     });
     unsafe { pac::NVIC::unmask(pac::Interrupt::PWM_IRQ_WRAP) };
 
+    // init sequencer
+    info!("init sequencer buttons...");
+    let seq_pins: [Pin<DynPinId, FunctionSioInput, PullDown>; 4] = [
+        pins.gpio18.reconfigure().into_dyn_pin(),
+        pins.gpio19.reconfigure().into_dyn_pin(),
+        pins.gpio20.reconfigure().into_dyn_pin(),
+        pins.gpio21.reconfigure().into_dyn_pin(),
+    ];
+
+    let mut seq_highs = [false; 4];
+
+    let mut seq_vec = tinyvec::array_vec!([u8; 16]);
+    let mut jump_to: Option<u8> = None;
+    let mut jump_from: Option<usize> = None;
+    let mut retrig_to: Option<u8> = None;
+    let mut retrig_from: Option<usize> = None;
+
+    let mut free_cursor: usize = 0;
+    let mut step_cursor: Option<usize> = None;
+    let mut retrig_cursor: Option<usize> = None;
+
+    let break_len = BREAK_BYTES[0x2c..].len();
+
     info!("loop start!");
     loop {
-        led_pin.set_high().unwrap();
-        delay.delay_ms(200);
-        led_pin.set_low().unwrap();
-        delay.delay_ms(200);
+        // sync cursors TODO: check
+        critical_section::with(|cs| {
+            let cursor = CURSOR.borrow(cs).get();
+            if let Some(r) = retrig_from {
+                retrig_cursor = Some(cursor);
+                free_cursor = (r + cursor) % break_len;
+            } else if let Some(j) = jump_from {
+                step_cursor = Some(cursor);
+                free_cursor = (j + cursor) % break_len;
+            } else {
+                free_cursor = cursor;
+            }
+        });
+        // sync sequencer buttons
+        for i in 0..seq_pins.len() {
+            if seq_pins[i].is_high().unwrap() && !seq_vec.contains(&(i as u8)) {
+                info!("push {}", i);
+                seq_vec.push(i as u8);
+            } else if seq_pins[i].is_low().unwrap() && seq_vec.contains(&(i as u8)) {
+                info!("pop {}", i);
+                seq_vec.retain(|&x| x != i as u8);
+            }
+            seq_highs[i] = seq_pins[i].is_high().unwrap();
+        }
+
+        // process jump
+        match seq_vec.first() {
+            None => {
+                jump_to = None;
+
+                critical_section::with(|cs| {
+                    RETRIG_CURSOR.borrow(cs).set(None);
+                });
+            }
+            Some(&j) => {
+                if jump_to.is_none() {
+                    jump_to = Some(j);
+
+                    critical_section::with(|cs| {
+                        RETRIG_CURSOR.borrow(cs).set(None);
+                        FREE_CURSOR.borrow(cs).set(
+                            BREAK_BYTES[0x2c..].len() / 4 * j as usize
+                        );
+                    });
+                    info!("jump to {}", j);
+                }
+                if seq_vec.len() > 1 {
+                    let retrig_to = break_len / 4 * j as usize;
+
+                    critical_section::with(|cs| {
+                        if RETRIG_CURSOR.borrow(cs).get().is_none() {
+                            RETRIG_CURSOR.borrow(cs).set(Some(retrig_to))
+                        }
+                    });
+
+                    let mut retrig_from = retrig_to;
+                    seq_highs.rotate_left(j as usize);
+                    for i in 1..seq_highs.len() {
+                        if seq_highs[i] {
+                            retrig_from += break_len / 256 * 2usize.pow(i as u32);
+                        }
+                    }
+
+                    critical_section::with(|cs| {
+                        let cursor = RETRIG_CURSOR.borrow(cs).get().unwrap();
+                        if cursor > retrig_from ||
+                            cursor < retrig_to &&
+                            cursor > (retrig_to + retrig_from) % break_len
+                        {
+                            info!("retrig to {} from {}", retrig_to, retrig_from);
+                            info!("with seq vec: {}", seq_highs);
+                            RETRIG_CURSOR.borrow(cs).set(Some(retrig_to));
+                        }
+                    });
+                } else {
+                    critical_section::with(|cs| {
+                        RETRIG_CURSOR.borrow(cs).set(None);
+                    })
+                }
+            }
+        }
     }
 }
 
 #[interrupt]
 fn PWM_IRQ_WRAP() {
     static mut PWMOUT_SNGL: Option<PwmOut> = None;
-    static mut BREAK_ITER: Option<core::iter::Cycle<core::slice::Iter<'_, u8>>> =
+    static mut AUDIO_SNGL: Option<core::iter::Cycle<core::slice::Iter<'_, u8>>> =
         None;
 
     if PWMOUT_SNGL.is_none() {
@@ -166,15 +382,52 @@ fn PWM_IRQ_WRAP() {
             *PWMOUT_SNGL = PWMOUT.borrow(cs).take();
         });
     }
-    if BREAK_ITER.is_none() {
-        *BREAK_ITER = Some(BREAK_BYTES.iter().cycle());
+    if AUDIO_SNGL.is_none() {
+        critical_section::with(|cs| {
+            *AUDIO_SNGL = AUDIO.borrow(cs).take();
+        });
     }
 
-    if let (Some(pwm), Some(break_iter)) = (PWMOUT_SNGL, BREAK_ITER) {
-        let val_a = ((*break_iter.next().unwrap() as u16) << 4) & 0xFFF;
-        let val_b = ((*break_iter.next().unwrap() as u16) << 4) & 0xFFF;
-        pwm.channel_a.set_duty(val_a);
-        pwm.channel_b.set_duty(val_b);
+    if let (Some(pwm), Some(break_iter)) = (PWMOUT_SNGL, AUDIO_SNGL) {
+        // let (mut val_a, mut val_b) = (0, 0);
+        // critical_section::with(|cs| {
+        //     if let Ok(mut audio) = AUDIO.borrow(cs).try_borrow_mut() {
+        //         audio.replace(BREAK_BYTES.iter().cycle());
+        //     }
+        // });
+        // critical_section::with(|cs| {
+            // val_a = (*AUDIO.borrow(cs).try_borrow().unwrap()).unwrap().next().unwrap() as u16;
+            // if let Some(a) = (*AUDIO.borrow(cs).try_borrow().unwrap()).as_mut().unwrap().next() {
+
+            // }
+            // val_a = STREAM.borrow(cs).unwrap().next().unwrap().clone();
+            // val_a = *AUDIO.borrow(cs).try_borrow().unwrap().unwrap().next().unwrap();
+            // if let Ok(mut audio) = AUDIO.borrow(cs).try_borrow() {
+            //     val_a = ((audio.as_mut().unwrap().next().unwrap() as u16) << 4) & 0xfff;
+                // val_a = ((*audio.as_mut().unwrap().next().unwrap() as u16) << 4) & 0xfff;
+            // }
+        // });
+        critical_section::with(|cs| {
+            let cursor_a = RETRIG_CURSOR.borrow(cs).get().unwrap_or(
+                FREE_CURSOR.borrow(cs).get()
+            );
+            pwm.channel_a.set_duty(
+                ((BREAK_BYTES[0x2c + cursor_a] as u16) << 4) & 0xfff
+            );
+            pwm.channel_b.set_duty(
+                ((BREAK_BYTES[0x2c + cursor_a + 1] as u16) << 4) & 0xfff
+            );
+            FREE_CURSOR.borrow(cs).set((FREE_CURSOR.borrow(cs).get() + 2) % BREAK_BYTES[0x2c..].len());
+            if RETRIG_CURSOR.borrow(cs).get().is_some() {
+                RETRIG_CURSOR.borrow(cs).set(
+                    Some((cursor_a + 2) % BREAK_BYTES[0x2c..].len())
+                );
+            }
+        });
+        // let val_a = ((*break_iter.next().unwrap() as u16) << 4) & 0xFFF;
+        // let val_b = ((*break_iter.next().unwrap() as u16) << 4) & 0xFFF;
+        // pwm.channel_a.set_duty(val_a);
+        // pwm.channel_b.set_duty(val_b);
         pwm.clear_interrupt();
     }
 }

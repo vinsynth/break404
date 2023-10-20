@@ -18,6 +18,10 @@ fugit = "0.3.7"
 rp2040-boot2 = "0.3.0"
 byteorder = { version = "1.4.3", default-features = false }
 critical-section = "1.1.2"
+tinyvec = "1.6.0"
+embedded-sdmmc = "0.5.0"
+fixed-slice-vec = "0.10.0"
+embedded-alloc = "0.5.0"
 
 # cargo build/run
 [profile.dev]
