@@ -60,6 +60,13 @@ impl TimeSource for DummyTimesource {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum CursorState {
+    Free,
+    Jump,
+    Retrig,
+}
+
 #[link_section = ".boot2"]
 #[used]
 pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
@@ -82,9 +89,9 @@ static AUDIO: Mutex<RefCell<Option<core::iter::Cycle<core::slice::Iter<'_, u8>>>
 // static STREAM: Mutex<Option<core::iter::Cycle<core::iter::Iterator::Iter<(dyn Iterator + 'static), u8>>>> = Mutex::new(None);
 
 static FREE_CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
-static RETRIG_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
-
-static CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
+static MOD_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
+// static JUMP_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
+// static RETRIG_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -274,32 +281,12 @@ fn main() -> ! {
     let mut seq_highs = [false; 4];
 
     let mut seq_vec = tinyvec::array_vec!([u8; 16]);
-    let mut jump_to: Option<u8> = None;
-    let mut jump_from: Option<usize> = None;
-    let mut retrig_to: Option<u8> = None;
-    let mut retrig_from: Option<usize> = None;
-
-    let mut free_cursor: usize = 0;
-    let mut step_cursor: Option<usize> = None;
-    let mut retrig_cursor: Option<usize> = None;
+    let mut cursor_state = CursorState::Free;
 
     let break_len = BREAK_BYTES[0x2c..].len();
 
     info!("loop start!");
     loop {
-        // sync cursors TODO: check
-        critical_section::with(|cs| {
-            let cursor = CURSOR.borrow(cs).get();
-            if let Some(r) = retrig_from {
-                retrig_cursor = Some(cursor);
-                free_cursor = (r + cursor) % break_len;
-            } else if let Some(j) = jump_from {
-                step_cursor = Some(cursor);
-                free_cursor = (j + cursor) % break_len;
-            } else {
-                free_cursor = cursor;
-            }
-        });
         // sync sequencer buttons
         for i in 0..seq_pins.len() {
             if seq_pins[i].is_high().unwrap() && !seq_vec.contains(&(i as u8)) {
@@ -312,61 +299,56 @@ fn main() -> ! {
             seq_highs[i] = seq_pins[i].is_high().unwrap();
         }
 
-        // process jump
-        match seq_vec.first() {
-            None => {
-                jump_to = None;
+        // process sequencer
+        if let Some(&j) = seq_vec.first() {
+            // process retrigger
+            if seq_vec.len() > 1 {
+                cursor_state = CursorState::Retrig;
+                let retrig_to = break_len / 4 * j as usize;
 
                 critical_section::with(|cs| {
-                    RETRIG_CURSOR.borrow(cs).set(None);
-                });
-            }
-            Some(&j) => {
-                if jump_to.is_none() {
-                    jump_to = Some(j);
-
-                    critical_section::with(|cs| {
-                        RETRIG_CURSOR.borrow(cs).set(None);
-                        FREE_CURSOR.borrow(cs).set(
-                            BREAK_BYTES[0x2c..].len() / 4 * j as usize
-                        );
-                    });
-                    info!("jump to {}", j);
-                }
-                if seq_vec.len() > 1 {
-                    let retrig_to = break_len / 4 * j as usize;
-
-                    critical_section::with(|cs| {
-                        if RETRIG_CURSOR.borrow(cs).get().is_none() {
-                            RETRIG_CURSOR.borrow(cs).set(Some(retrig_to))
-                        }
-                    });
-
-                    let mut retrig_from = retrig_to;
-                    seq_highs.rotate_left(j as usize);
-                    for i in 1..seq_highs.len() {
-                        if seq_highs[i] {
-                            retrig_from += break_len / 256 * 2usize.pow(i as u32);
-                        }
+                    if MOD_CURSOR.borrow(cs).get().is_none() {
+                        MOD_CURSOR.borrow(cs).set(Some(retrig_to))
                     }
+                });
 
-                    critical_section::with(|cs| {
-                        let cursor = RETRIG_CURSOR.borrow(cs).get().unwrap();
-                        if cursor > retrig_from ||
-                            cursor < retrig_to &&
-                            cursor > (retrig_to + retrig_from) % break_len
-                        {
-                            info!("retrig to {} from {}", retrig_to, retrig_from);
-                            info!("with seq vec: {}", seq_highs);
-                            RETRIG_CURSOR.borrow(cs).set(Some(retrig_to));
-                        }
-                    });
-                } else {
-                    critical_section::with(|cs| {
-                        RETRIG_CURSOR.borrow(cs).set(None);
-                    })
+                let mut retrig_from = retrig_to;
+                seq_highs.rotate_left(j as usize);
+                for i in 1..seq_highs.len() {
+                    if seq_highs[i] {
+                        retrig_from += break_len / 256 * 2usize.pow(i as u32);
+                    }
                 }
+
+                critical_section::with(|cs| {
+                    let cursor = MOD_CURSOR.borrow(cs).get().unwrap();
+                    if cursor > retrig_from ||
+                        cursor < retrig_to &&
+                        cursor > (retrig_to + retrig_from) % break_len
+                    {
+                        info!("retrig to {} from {}", retrig_to, retrig_from);
+                        MOD_CURSOR.borrow(cs).set(Some(retrig_to));
+                    }
+                });
+            } else if cursor_state != CursorState::Jump {
+                cursor_state = CursorState::Jump;
+
+                critical_section::with(|cs| {
+                    MOD_CURSOR.borrow(cs).set(
+                        Some(BREAK_BYTES[0x2c..].len() / 4 * j as usize)
+                    );
+                });
+                info!("jump to {}", j);
             }
+        } else { // process jump
+            cursor_state = CursorState::Free;
+
+            critical_section::with(|cs| {
+                if MOD_CURSOR.borrow(cs).get().is_some() {
+                    info!("free");
+                }
+                MOD_CURSOR.borrow(cs).set(None);
+            });
         }
     }
 }
@@ -408,7 +390,7 @@ fn PWM_IRQ_WRAP() {
             // }
         // });
         critical_section::with(|cs| {
-            let cursor_a = RETRIG_CURSOR.borrow(cs).get().unwrap_or(
+            let cursor_a = MOD_CURSOR.borrow(cs).get().unwrap_or(
                 FREE_CURSOR.borrow(cs).get()
             );
             pwm.channel_a.set_duty(
@@ -418,8 +400,8 @@ fn PWM_IRQ_WRAP() {
                 ((BREAK_BYTES[0x2c + cursor_a + 1] as u16) << 4) & 0xfff
             );
             FREE_CURSOR.borrow(cs).set((FREE_CURSOR.borrow(cs).get() + 2) % BREAK_BYTES[0x2c..].len());
-            if RETRIG_CURSOR.borrow(cs).get().is_some() {
-                RETRIG_CURSOR.borrow(cs).set(
+            if MOD_CURSOR.borrow(cs).get().is_some() {
+                MOD_CURSOR.borrow(cs).set(
                     Some((cursor_a + 2) % BREAK_BYTES[0x2c..].len())
                 );
             }
