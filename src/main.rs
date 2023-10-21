@@ -14,6 +14,7 @@ use hal::gpio::{
     FunctionSioInput,
     Pin,
     PullDown,
+    PullUp,
 };
 use hal::pll::common_configs::PLL_USB_48MHZ;
 use hal::pll::PLLConfig;
@@ -36,7 +37,7 @@ use fugit::{HertzU32, RateExtU32};
 enum SequencerState {
     Free,
     Retrig { to: usize, from: usize },
-    Hold,
+    Hold { to: usize },
 }
 
 #[derive(Debug, PartialEq)]
@@ -171,21 +172,22 @@ fn main() -> ! {
     //     Jump => HoldR => ReturnR => Free..
     //     once: Jump*, Return*
     //     loop: Free, Hold*
-    let seq_pins: [Pin<DynPinId, FunctionSioInput, PullDown>; 4] = [
-        pins.gpio18.reconfigure().into_dyn_pin(),
-        pins.gpio19.reconfigure().into_dyn_pin(),
-        pins.gpio20.reconfigure().into_dyn_pin(),
-        pins.gpio21.reconfigure().into_dyn_pin(),
+    let seq_pins: [Pin<DynPinId, FunctionSioInput, PullUp>; 5] = [
+        pins.gpio6.reconfigure().into_dyn_pin(),
+        pins.gpio5.reconfigure().into_dyn_pin(),
+        pins.gpio4.reconfigure().into_dyn_pin(),
+        pins.gpio3.reconfigure().into_dyn_pin(),
+        pins.gpio2.reconfigure().into_dyn_pin(),
     ];
 
-    let mut seq_highs = [false; 4];
+    let mut seq_downs = [false; 5];
     let mut seq_vec = tinyvec::array_vec!([u8; 16]);
 
     let mut seq_state: SequencerState = SequencerState::Free;
     let mut seq_trans: Option<SequencerTrans> = None;
 
     let break_len = BREAK_BYTES[0x2c..].len();
-    let steps_len = 16;
+    let steps_len = 8;
 
     info!("loop start!");
     loop {
@@ -199,25 +201,25 @@ fn main() -> ! {
         // sync sequencer buttons
         let seq_vec_was = seq_vec.clone();
         for i in 0..seq_pins.len() {
-            if seq_pins[i].is_high().unwrap() && !seq_vec.contains(&(i as u8)) {
+            if seq_pins[i].is_low().unwrap() && !seq_vec.contains(&(i as u8)) {
                 seq_vec.push(i as u8);
-            } else if seq_pins[i].is_low().unwrap() && seq_vec.contains(&(i as u8)) {
+            } else if seq_pins[i].is_high().unwrap() && seq_vec.contains(&(i as u8)) {
                 seq_vec.retain(|&x| x != i as u8);
             }
-            seq_highs[i] = seq_pins[i].is_high().unwrap();
+            seq_downs[i] = seq_pins[i].is_low().unwrap();
         }
 
         // process sequencer
         if seq_vec_was != seq_vec {
             if let Some(&t) = seq_vec.first() {
-                if seq_vec.len() > 1 {
+                if seq_vec.len() > 1  {
                     // init retrig
                     let to = break_len / steps_len * t as usize;
 
                     let mut from = to;
-                    seq_highs.rotate_left(t as usize);
-                    for i in 1..seq_highs.len() {
-                        if seq_highs[i] {
+                    seq_downs.rotate_left(t as usize);
+                    for i in 1..seq_downs.len() {
+                        if seq_downs[i] {
                             from += break_len / steps_len / 32 * 2usize.pow(i as u32);
                         }
                     }
@@ -225,23 +227,17 @@ fn main() -> ! {
                     seq_trans = Some(SequencerTrans::Trig { to, from });
                 } else {
                     // init jump
-                    match seq_trans {
-                        Some(SequencerTrans::Trig { .. }) => (),
-                        _ => {
-                            let to = break_len / steps_len * t as usize;
+                    let to = break_len / steps_len * t as usize;
 
+                    match (&seq_state, &seq_trans) {
+                        (_, &Some(SequencerTrans::Trig { .. })) => (),
+                        // (&SequencerState::Hold { to: t }, _) if t == to => (),
+                        _ => {
                             info!("input jump to {}!", to);
-                            info!("x: {}, y: {}, c: {}", joy_x, joy_y, joy_c_down);
                             seq_trans = Some(SequencerTrans::Jump { to });
                         }
                     }
                 }
-            } else if let SequencerState::Retrig { .. } = seq_state {
-                info!("input return!");
-                seq_trans = Some(SequencerTrans::Return);
-            } else if seq_state == SequencerState::Hold {
-                info!("input resync!");
-                seq_trans = Some(SequencerTrans::Resync);
             }
         } 
 
@@ -249,32 +245,39 @@ fn main() -> ! {
         match (&seq_state, &seq_trans) {
             (&SequencerState::Free, None) => (),
             (_, &Some(SequencerTrans::Trig { to, from })) => critical_section::with(|cs| {
-                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len) < 2 {
+                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len / 32) < 2 {
                     info!("init retrig to {} from {}!", to, from);
                     MOD_CURSOR.borrow(cs).set(Some(to));
                     seq_state = SequencerState::Retrig { to, from };
                     seq_trans = None;
                 }
             }),
-            (_, &Some(SequencerTrans::Jump { to, .. })) => critical_section::with(|cs| {
-                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len / 32) < 2 {
+            (_, &Some(SequencerTrans::Jump { to })) => critical_section::with(|cs| {
+                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len) < 2 {
                     info!("jump to {}!", to);
                     MOD_CURSOR.borrow(cs).set(Some(to));
-                    seq_state = SequencerState::Hold;
+                    seq_state = SequencerState::Hold { to };
                     seq_trans = None;
                 }
             }),
-            (&SequencerState::Retrig { to, from }, None) => critical_section::with(|cs| {
-                if let Some(cursor) = MOD_CURSOR.borrow(cs).get() {
-                    if cursor > from ||
-                        cursor < to &&
-                        cursor > (from + to) % break_len
-                    {
-                        info!("retrig to {} from {}!", to, from);
-                        MOD_CURSOR.borrow(cs).set(Some(to));
-                    }
+            (&SequencerState::Retrig { to, from }, None) => {
+                if seq_vec.is_empty() {
+                    info!("input return!");
+                    seq_trans = Some(SequencerTrans::Return);
+                } else {
+                    critical_section::with(|cs| {
+                        if let Some(cursor) = MOD_CURSOR.borrow(cs).get() {
+                            if cursor > from ||
+                                cursor < to &&
+                                cursor > (from + to) % break_len
+                            {
+                                info!("retrig to {} from {}!", to, from);
+                                MOD_CURSOR.borrow(cs).set(Some(to));
+                            }
+                        }
+                    });
                 }
-            }),
+            }
             (&SequencerState::Retrig { .. }, &Some(SequencerTrans::Return)) => critical_section::with(|cs| {
                 if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len / 32) < 2 {
                     info!("return from retrig!");
@@ -283,7 +286,13 @@ fn main() -> ! {
                     seq_trans = None;
                 }
             }),
-            (&SequencerState::Hold, &Some(SequencerTrans::Resync)) => critical_section::with(|cs| {
+            (&SequencerState::Hold { .. }, None) => {
+                if seq_vec.is_empty() {
+                    info!("input resync!");
+                    seq_trans = Some(SequencerTrans::Resync);
+                }
+            }
+            (&SequencerState::Hold { .. }, &Some(SequencerTrans::Resync)) => critical_section::with(|cs| {
                 if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len) < 2 {
                     info!("resync from jump!");
                     MOD_CURSOR.borrow(cs).set(None);
