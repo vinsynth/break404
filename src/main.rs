@@ -187,7 +187,7 @@ fn main() -> ! {
     let mut seq_trans: Option<SequencerTrans> = None;
 
     let break_len = BREAK_BYTES[0x2c..].len();
-    let steps_len = 8;
+    let steps_len = 16;
 
     info!("loop start!");
     loop {
@@ -225,7 +225,7 @@ fn main() -> ! {
                     }
                     info!("input retrig to {} from {}!", to, from);
                     seq_trans = Some(SequencerTrans::Trig { to, from });
-                } else {
+                } else if seq_vec_was.is_empty() {
                     // init jump
                     let to = break_len / steps_len * t as usize;
 
@@ -261,7 +261,7 @@ fn main() -> ! {
                 }
             }),
             (&SequencerState::Retrig { to, from }, None) => {
-                if seq_vec.is_empty() {
+                if seq_vec.get(1).is_none() {
                     info!("input return!");
                     seq_trans = Some(SequencerTrans::Return);
                 } else {
