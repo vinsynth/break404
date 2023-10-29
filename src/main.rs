@@ -13,7 +13,6 @@ use hal::gpio::{
     DynPinId,
     FunctionSioInput,
     Pin,
-    PullDown,
     PullUp,
 };
 use hal::pll::common_configs::PLL_USB_48MHZ;
@@ -172,7 +171,10 @@ fn main() -> ! {
     //     Jump => HoldR => ReturnR => Free..
     //     once: Jump*, Return*
     //     loop: Free, Hold*
-    let seq_pins: [Pin<DynPinId, FunctionSioInput, PullUp>; 5] = [
+    let seq_pins: [Pin<DynPinId, FunctionSioInput, PullUp>; 8] = [
+        pins.gpio9.reconfigure().into_dyn_pin(),
+        pins.gpio8.reconfigure().into_dyn_pin(),
+        pins.gpio7.reconfigure().into_dyn_pin(),
         pins.gpio6.reconfigure().into_dyn_pin(),
         pins.gpio5.reconfigure().into_dyn_pin(),
         pins.gpio4.reconfigure().into_dyn_pin(),
@@ -180,7 +182,7 @@ fn main() -> ! {
         pins.gpio2.reconfigure().into_dyn_pin(),
     ];
 
-    let mut seq_downs = [false; 5];
+    let mut seq_downs = [false; 8];
     let mut seq_vec = tinyvec::array_vec!([u8; 16]);
 
     let mut seq_state: SequencerState = SequencerState::Free;
@@ -241,7 +243,6 @@ fn main() -> ! {
             }
         } 
 
-        // process sequencer command
         match (&seq_state, &seq_trans) {
             (&SequencerState::Free, None) => (),
             (_, &Some(SequencerTrans::Trig { to, from })) => critical_section::with(|cs| {
