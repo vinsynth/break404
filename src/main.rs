@@ -245,16 +245,23 @@ fn main() -> ! {
 
         match (&seq_state, &seq_trans) {
             (&SequencerState::Free, None) => (),
-            (_, &Some(SequencerTrans::Trig { to, from })) => critical_section::with(|cs| {
+            (_, &Some(SequencerTrans::Trig { mut to, mut from })) => critical_section::with(|cs| {
                 if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len / 32) < 2 {
+                    if FREE_CURSOR.borrow(cs).get() > break_len / 2 {
+                        to += break_len / 2;
+                        from += break_len / 2;
+                    }
                     info!("init retrig to {} from {}!", to, from);
                     MOD_CURSOR.borrow(cs).set(Some(to));
                     seq_state = SequencerState::Retrig { to, from };
                     seq_trans = None;
                 }
             }),
-            (_, &Some(SequencerTrans::Jump { to })) => critical_section::with(|cs| {
+            (_, &Some(SequencerTrans::Jump { mut to })) => critical_section::with(|cs| {
                 if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len) < 2 {
+                    if FREE_CURSOR.borrow(cs).get() > break_len / 2 {
+                        to += break_len / 2;
+                    }
                     info!("jump to {}!", to);
                     MOD_CURSOR.borrow(cs).set(Some(to));
                     seq_state = SequencerState::Hold { to };
