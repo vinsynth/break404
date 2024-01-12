@@ -1,7 +1,10 @@
 #![no_std]
 #![no_main]
 
+use alloc::borrow::ToOwned;
+use alloc::collections::binary_heap::IntoIter;
 use defmt::*;
+use defmt::export::usize;
 use defmt_rtt as _;
 
 use panic_halt as _;
@@ -29,8 +32,8 @@ use core::cell::{Cell, RefCell};
 use critical_section::Mutex;
 
 use fugit::{HertzU32, RateExtU32};
-
-// mod sequencer;
+use alloc::collections::VecDeque;
+use core::iter::Cycle;
 
 #[derive(Debug, PartialEq)]
 enum SequencerState {
@@ -47,9 +50,106 @@ enum SequencerTrans {
     Resync,
 }
 
+#[derive(Clone, Debug)]
+struct Grains<'a> {
+    samples: &'a [u8],
+    zeroes_orig: VecDeque<usize>,
+    zeroes: VecDeque<usize>,
+    nth_grain: VecDeque<u8>,
+    speed: f32,
+}
+
+impl<'a> Grains<'a> {
+    pub fn new (samples: &'a [u8]) -> Self {
+        let zeroes = samples
+            .windows(2)
+            .flat_map(&<[u8; 2]>::try_from)
+            .enumerate()
+            .filter(|(_, [a, b])| Self::is_zero_crossing(a, b))
+            .filter(|(i, _)| i % 4 == 0)
+            .map(|(i, _)| i)
+            .collect::<VecDeque<_>>();
+        info!("zeroes len: {}", zeroes.len());
+        Self {
+            samples,
+            zeroes_orig: zeroes.clone(),
+            zeroes, 
+            nth_grain: VecDeque::new(),
+            speed: 1.5,
+        }
+    }
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = speed;
+    }
+
+    fn is_zero_crossing(sample_a: &u8, sample_b: &u8) -> bool {
+        (u8::MAX / 2).cmp(sample_a) != (u8::MAX / 2).cmp(sample_b)
+    }
+}
+
+impl<'a> Iterator for Grains<'a> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        while self.zeroes.len() + self.nth_grain.len() > 0 {
+            // next sample
+            if let Some(g) = self.nth_grain.pop_front() {
+                return Some(g);
+            }
+
+            // next grain
+            // TODO: fix irregular timestretch
+            // - check if due to while loop or algorithm
+            // -- try alternate impl using overall cursor and this_n instead of VecDeque
+            // TODO: impl speed = 0 (repeat grain)
+            if let Some(z) = self.zeroes.pop_front() {
+                if self.speed == 0. {
+                    crate::panic!("zero speed not implemented");
+                }
+                let n = ((self.zeroes.len() + 1) as f32 / self.speed) as usize -
+                    (self.zeroes.len() as f32 / self.speed) as usize;
+
+                info!("{}", self.samples[z]);
+                self.nth_grain = if let Some(&z_next) = self.zeroes.get(0) {
+                    VecDeque::from(self.samples[z..z_next].repeat(n))
+                } else {
+                    VecDeque::from(vec![self.samples[z]])
+                };
+            }
+        }
+        self.zeroes = self.zeroes_orig.clone();
+        Some(0)
+    }
+}
+
+trait SliceExt {
+    fn grains(&self) -> Grains<'_>;
+}
+
+impl SliceExt for [u8] {
+    fn grains(&self) -> Grains<'_> {
+        Grains::new(self)
+    }
+}
+
+static BREAK_BYTES: &[u8] = include_bytes!("../assets/lc_mono8.wav");
+static GRAINS: Mutex<RefCell<Option<Grains>>> = Mutex::new(RefCell::new(None));
+
+static FREE_CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
+static MOD_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
+static SPEED: Mutex<Cell<usize>> = Mutex::new(Cell::new(1));
+
 #[link_section = ".boot2"]
 #[used]
 pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+
+extern crate alloc;
+use alloc::vec::Vec;
+use alloc::vec;
+use embedded_alloc::Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 // 110.25 MHz clock, multiple of 44.1 kHz sample rate
@@ -63,13 +163,17 @@ const PLL_SYS_110MHZ: PLLConfig = PLLConfig {
 type PwmOut = pwm::Slice<pwm::Pwm0, pwm::FreeRunning>;
 static PWMOUT: Mutex<RefCell<Option<PwmOut>>> = Mutex::new(RefCell::new(None));
 
-static BREAK_BYTES: &[u8] = include_bytes!("../assets/lc8.wav");
-
-static FREE_CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
-static MOD_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
-
 #[rp2040_hal::entry]
 fn main() -> ! {
+    // init heap
+    info!("init heap...");
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 250000;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+    }
+    
     // init clocks
     info!("init clocks...");
     let mut pac = pac::Peripherals::take().unwrap();
@@ -84,7 +188,7 @@ fn main() -> ! {
     let mut clocks = ClocksManager::new(pac.CLOCKS);
     let pll_sys = hal::pll::setup_pll_blocking(
         pac.PLL_SYS,
-        xosc.operating_frequency().into(),
+        xosc.operating_frequency(),
         PLL_SYS_110MHZ,
         &mut clocks,
         &mut pac.RESETS,
@@ -92,7 +196,7 @@ fn main() -> ! {
     .unwrap();
     let pll_usb = hal::pll::setup_pll_blocking(
         pac.PLL_USB,
-        xosc.operating_frequency().into(),
+        xosc.operating_frequency(),
         PLL_USB_48MHZ,
         &mut clocks,
         &mut pac.RESETS,
@@ -132,7 +236,7 @@ fn main() -> ! {
     info!(
         "pwm freq: {} Hz",
         clocks.system_clock.freq().to_Hz() /
-            ((pwm.get_top() as u32 + 1) * (0 + 1) * (1 + (0 / 16)))
+            (pwm.get_top() as u32 + 1)
     );
 
     pwm.channel_a.output_to(pins.gpio16); // left channel
@@ -161,6 +265,8 @@ fn main() -> ! {
 
     let mut joy_x = 0;
     let mut joy_y = 0;
+    let mut joy_x_was = joy_x;
+    let mut joy_y_was = joy_y;
 
     // init sequencer
     info!("init sequencer buttons...");
@@ -172,24 +278,26 @@ fn main() -> ! {
     //     once: Jump*, Return*
     //     loop: Free, Hold*
     let seq_pins: [Pin<DynPinId, FunctionSioInput, PullUp>; 8] = [
-        pins.gpio9.reconfigure().into_dyn_pin(),
-        pins.gpio8.reconfigure().into_dyn_pin(),
-        pins.gpio7.reconfigure().into_dyn_pin(),
-        pins.gpio6.reconfigure().into_dyn_pin(),
-        pins.gpio5.reconfigure().into_dyn_pin(),
-        pins.gpio4.reconfigure().into_dyn_pin(),
-        pins.gpio3.reconfigure().into_dyn_pin(),
         pins.gpio2.reconfigure().into_dyn_pin(),
+        pins.gpio3.reconfigure().into_dyn_pin(),
+        pins.gpio4.reconfigure().into_dyn_pin(),
+        pins.gpio5.reconfigure().into_dyn_pin(),
+        pins.gpio6.reconfigure().into_dyn_pin(),
+        pins.gpio7.reconfigure().into_dyn_pin(),
+        pins.gpio8.reconfigure().into_dyn_pin(),
+        pins.gpio9.reconfigure().into_dyn_pin(),
     ];
 
     let mut seq_downs = [false; 8];
-    let mut seq_vec = tinyvec::array_vec!([u8; 16]);
+    let mut seq_vec = tinyvec::array_vec!([u8; 8]);
 
     let mut seq_state: SequencerState = SequencerState::Free;
     let mut seq_trans: Option<SequencerTrans> = None;
 
     let break_len = BREAK_BYTES[0x2c..].len();
     let steps_len = 16;
+
+    let mut inc = 0;
 
     info!("loop start!");
     loop {
@@ -201,7 +309,7 @@ fn main() -> ! {
         let joy_c_down = joy_c_pin.is_low().unwrap();
 
         // sync sequencer buttons
-        let seq_vec_was = seq_vec.clone();
+        let seq_vec_was = seq_vec;
         for i in 0..seq_pins.len() {
             if seq_pins[i].is_low().unwrap() && !seq_vec.contains(&(i as u8)) {
                 seq_vec.push(i as u8);
@@ -209,6 +317,25 @@ fn main() -> ! {
                 seq_vec.retain(|&x| x != i as u8);
             }
             seq_downs[i] = seq_pins[i].is_low().unwrap();
+        }
+
+        // if joy_x != joy_x_was {
+        //     critical_section::with(|cs| {
+        //         if GRAINS.borrow_ref(cs).is_some() {
+        //             GRAINS.
+        //                 borrow_ref_mut(cs)
+        //                 .as_mut()
+        //                 .expect("failed to take grains as mut")
+        //                 .
+        //         }
+        //     });
+        // }
+
+        if joy_c_down && inc > 4096 {
+            info!("joystick: ({}, {})", joy_x, joy_y);
+            inc = 0;
+        } else {
+            inc += 1;
         }
 
         // process sequencer
@@ -220,8 +347,8 @@ fn main() -> ! {
 
                     let mut from = to;
                     seq_downs.rotate_left(t as usize);
-                    for i in 1..seq_downs.len() {
-                        if seq_downs[i] {
+                    for (i, &d) in seq_downs.iter().enumerate().skip(1) {
+                        if d {
                             from += break_len / steps_len / 32 * 2usize.pow(i as u32);
                         }
                     }
@@ -322,26 +449,75 @@ fn PWM_IRQ_WRAP() {
             *PWMOUT_SNGL = PWMOUT.borrow(cs).take();
         });
     }
-
-    if let Some(pwm)= PWMOUT_SNGL {
+    critical_section::with(|cs| {
+        if GRAINS.borrow_ref(cs).is_none() {
+            GRAINS
+                .borrow_ref_mut(cs)
+                .replace(BREAK_BYTES[0x2c..].grains());
+        }
+    });
+    if let Some(pwm) = PWMOUT_SNGL {
         critical_section::with(|cs| {
-            let cursor_a = MOD_CURSOR.borrow(cs).get().unwrap_or(
-                FREE_CURSOR.borrow(cs).get()
+            pwm.channel_a.set_duty(((GRAINS
+                .borrow_ref_mut(cs)
+                .as_mut()
+                .expect("failed  to get ref_mut for grains")
+                .next()
+                .unwrap_or(u8::MAX / 2) as u16) << 4) &0xfff
             );
-            pwm.channel_a.set_duty(
-                ((BREAK_BYTES[0x2c + cursor_a] as u16) << 4) & 0xfff
-            );
-            pwm.channel_b.set_duty(
-                ((BREAK_BYTES[0x2c + cursor_a + 1] as u16) << 4) & 0xfff
-            );
-            FREE_CURSOR.borrow(cs).set((FREE_CURSOR.borrow(cs).get() + 2) % BREAK_BYTES[0x2c..].len());
-            if MOD_CURSOR.borrow(cs).get().is_some() {
-                MOD_CURSOR.borrow(cs).set(
-                    Some((cursor_a + 2) % BREAK_BYTES[0x2c..].len())
-                );
-            }
         });
         pwm.clear_interrupt();
+        // critical_section::with(|cs| {
+            // precalculate number grains
+            // if GRAIN_N.borrow(cs).get().is_none() {
+            //     let mut cursor = 0;
+            //     'l: loop {
+            //         GRAIN_N.borrow(cs).set(GRAIN_N.borrow(cs).get());
+            //         while !zero_crossed(0x2c + cursor) {
+            //             cursor += 1;
+            //             if cursor >= BREAK_BYTES.len() - 1 {
+            //                 break 'l
+            //             }
+            //         }
+            //     }
+            // }
+
+            // let cursor = MOD_CURSOR.borrow(cs).get().unwrap_or(
+            //     FREE_CURSOR.borrow(cs).get()
+            // );
+
+            // calculate current grain
+            // if zero_crossing(cursor) {
+                // GRAIN.borrow(cs).get_mut().start = cursor;
+                // GRAIN.borrow(cs).get_mut().end = cursor + 1;
+                // while !zero_crossing(0x2c + GRAIN.borrow(cs).get().end) {
+                    // GRAIN.borrow(cs).get_mut().end = GRAIN.borrow(cs).get().end;
+                // }
+            // }
+
+            // pwm.channel_a.set_duty(
+            //     ((BREAK_BYTES[0x2c + cursor] as u16) << 4) & 0xfff
+            // );
+            // pwm.channel_b.set_duty(
+            //     ((BREAK_BYTES[0x2c + cursor + 1] as u16) << 4) & 0xfff
+            // );
+            // FREE_CURSOR.borrow(cs).set((FREE_CURSOR.borrow(cs).get() + 2) % BREAK_BYTES[0x2c..].len());
+
+            // if cursor >= GRAIN.borrow(cs).get().end {
+            //     FREE_CURSOR.borrow(cs).set(GRAIN.borrow(cs).get().start);
+            // }
+            // if FREE_CURSOR.borrow(cs).get() >= GRAIN_END.borrow(cs).get() {
+            //         FREE_CURSOR.borrow(cs).set(GRAIN_START.borrow(cs).get());
+            //         GRAIN_N.borrow(cs).set(GRAIN_N.borrow(cs).get() + 1);
+
+            //         GRAIN_END.borrow(cs).set(usize::MAX);
+            // }
+            // if MOD_CURSOR.borrow(cs).get().is_some() {
+            //     MOD_CURSOR.borrow(cs).set(
+            //         Some((cursor + 2) % BREAK_BYTES[0x2c..].len())
+            //     );
+            // }
+        // });
     }
 }
 
