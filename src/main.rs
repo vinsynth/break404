@@ -4,7 +4,6 @@
 use defmt::*;
 use defmt_rtt as _;
 
-use libm::sqrtf;
 use panic_halt as _;
 
 use rp2040_hal as hal;
@@ -196,6 +195,10 @@ impl<'a> Grains<'a> {
         self.speed = speed
     }
 
+    pub fn last_n(&self) -> usize {
+        self.samples.len() / self.grain_len
+    }
+
     fn is_zero_crossing(sample_a: &u8, sample_b: &u8) -> bool {
         (u8::MAX / 2).cmp(sample_a) != (u8::MAX / 2).cmp(sample_b)
     }
@@ -207,18 +210,9 @@ impl<'a> Iterator for Grains<'a> {
     fn next(&mut self) -> Option<u8> {
         // next grain
         while self.grain.len() == 0 {
-            let n = self.grain.n() % (self.samples.len() / self.grain_len);
+            let n = self.grain.n() % self.last_n();
             let start = n * self.grain_len;
 
-            // let end = if self.speed == 0. {
-            //     self.samples.get(start..)
-            //         .and_then(|s| s
-            //             .iter()
-            //             .tuple_windows::<(_, _)>()
-            //             .enumerate()
-            //             .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
-            //             .map(|(i, _)| start + i)
-            //         ).unwrap_or(self.samples.len())
             let grain_len = if self.speed == 0. {
                 self.grain_len
             } else {
@@ -262,6 +256,55 @@ impl<'a> Iterator for Grains<'a> {
         // next sample
         self.grain.take()
     }
+
+    fn nth(&mut self, n: usize) -> Option<u8> {
+        // next grain
+        let mut grain = Grain::new(&[], 0);
+        while grain.len() == 0 {
+            let n = n % (self.samples.len() / self.grain_len);
+            let start = n * self.grain_len;
+
+            let grain_len = if self.speed == 0. {
+                self.grain_len
+            } else {
+                (self.grain_len as f32 / self.speed) as usize
+            };
+
+            let upper = self.samples.get(start + grain_len..)
+                .and_then(|s| s
+                    .iter()
+                    .tuple_windows::<(_, _)>()
+                    .enumerate()
+                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+                    .map(|(i, _)| start + grain_len + i)
+                ).unwrap_or(self.samples.len());
+            let lower = self.samples.get(start..start + grain_len)
+                .and_then(|s| s
+                    .iter()
+                    .rev()
+                    .tuple_windows::<(_, _)>()
+                    .enumerate()
+                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+                    .map(|(i, _)| start + grain_len - i)
+                ).unwrap_or(upper);
+
+            let u_diff = (start + grain_len).abs_diff(upper);
+            let l_diff = (start + grain_len).abs_diff(lower);
+            let end = if u_diff < l_diff {
+                upper
+            } else {
+                lower
+            };
+
+            grain = Grain::new(
+                &self.samples[start..end],
+                if self.speed == 0. { n } else { n + 1 }
+            );
+        }
+        self.grain = grain;
+        // next sample
+        self.grain.take()
+    }
 }
 
 trait SliceExt {
@@ -279,15 +322,12 @@ static GRAINS: Mutex<RefCell<Option<Grains>>> = Mutex::new(RefCell::new(None));
 
 static FREE_CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
 static MOD_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
-static SPEED: Mutex<Cell<usize>> = Mutex::new(Cell::new(1));
 
 #[link_section = ".boot2"]
 #[used]
 pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 extern crate alloc;
-use alloc::vec::Vec;
-use alloc::vec;
 use embedded_alloc::Heap;
 
 #[global_allocator]
@@ -472,8 +512,8 @@ fn main() -> ! {
             };
             critical_section::with(|cs| {
                 if GRAINS.borrow_ref(cs).is_some() {
-                    GRAINS.
-                        borrow_ref_mut(cs)
+                    GRAINS
+                        .borrow_ref_mut(cs)
                         .as_mut()
                         .expect("failed to take grains as mut")
                         .set_speed(speed);
@@ -512,6 +552,21 @@ fn main() -> ! {
                 }
             }
         } 
+        if !seq_vec.is_empty() && seq_vec_was.is_empty() {
+            critical_section::with(|cs| {
+                if GRAINS.borrow_ref(cs).is_some() {
+                    let last_n = GRAINS
+                        .borrow_ref(cs)
+                        .as_ref()
+                        .map_or(0, |g| g.last_n());
+                    GRAINS
+                        .borrow_ref_mut(cs)
+                        .as_mut()
+                        .expect("failed to take grains as mut")
+                        .nth(last_n / 2);
+                }
+            });
+        }
 
         match (&seq_state, &seq_trans) {
             (&SequencerState::Free, None) => (),
