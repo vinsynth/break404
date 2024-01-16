@@ -1,12 +1,10 @@
 #![no_std]
 #![no_main]
 
-use alloc::borrow::ToOwned;
-use alloc::collections::binary_heap::IntoIter;
 use defmt::*;
-use defmt::export::usize;
 use defmt_rtt as _;
 
+use libm::sqrtf;
 use panic_halt as _;
 
 use rp2040_hal as hal;
@@ -28,12 +26,13 @@ use pac::interrupt;
 use embedded_hal::digital::v2::InputPin;
 use embedded_hal::PwmPin;
 
-use core::cell::{Cell, RefCell};
-use critical_section::Mutex;
-
 use fugit::{HertzU32, RateExtU32};
+
+use critical_section::Mutex;
+use core::cell::{Cell, RefCell};
 use alloc::collections::VecDeque;
-use core::iter::Cycle;
+
+use itertools::Itertools;
 
 #[derive(Debug, PartialEq)]
 enum SequencerState {
@@ -50,36 +49,151 @@ enum SequencerTrans {
     Resync,
 }
 
-#[derive(Clone, Debug)]
+// struct Grain<'a> {
+//     samples: &'a [u8],
+//     queue: VecDeque<u8>,
+//     len: usize,
+//     end: usize,
+// }
+
+// impl<'a> Grain<'a> {
+//     pub fn new(samples: &'a [u8], len: usize, end: usize) -> Self {
+//         let queue = VecDeque::from(samples.clone().to_vec());
+//         Self {
+//             samples,
+//             queue,
+//             len,
+//             end,
+//         }
+//     }
+
+//     pub fn count(&self) -> usize {
+//         self.queue.len()
+//     }
+
+//     pub fn len(&self) -> usize {
+//         self.len.min(self.samples.len())
+//     }
+
+//     pub fn take_raw(&mut self) -> Option<u8> {
+//         self.queue.pop_front()
+//     }
+
+//     pub fn take_mixed(&mut self, other: Option<&mut Grain>) -> Option<u8> {
+//         if let Some(s) = self.take_raw() {
+//             if let Some(other) = other {
+//                 if let Some(o) = other.take_raw() {
+//                     //                  pi(self.len()-self.queue.len())
+//                     // 1/2(o-s+(o-s)cos(-------------------------------))
+//                     //                  min(self.len(), other.len())
+//                     // Some(
+//                     //     ((o + s) as f32 + (o - s) as f32 * libm::cosf(
+//                     //         core::f32::consts::PI * (self.len() - self.count()) as f32 /
+//                     //             self.len().min(other.len()) as f32
+//                     //     )) as u8 / 2
+//                     // );
+//                     let s = s as f32;
+//                     let o = o as f32;
+//                     return Some((o + (o - s) / self.len().min(other.len()) as f32 * (self.len() as f32 - self.count() as f32)) as u8);
+//                 }
+//             }
+//             return Some(s);
+//         }
+//         None
+//         // self.take_raw()
+//     }
+// }
+
+// struct Grains<'a> {
+//     samples: &'a [u8],
+//     grains: ConstGenericRingBuffer<Grain<'a>, 2>,
+//     grain_len: usize,
+//     smear: f32,
+//     speed: f32,
+// }
+
+// impl<'a> Grains<'a> {
+//     pub fn new(samples: &'a [u8], grain_len: usize) -> Self {
+//         let speed = 1.;
+//         let mut smear = 1_f32;
+//         let mut grains = ConstGenericRingBuffer::new();
+//         grains.push(Grain::new(&samples[..grain_len], grain_len, grain_len));
+//         grains.push(Grain::new(&samples[grain_len..2 * grain_len], grain_len, 2 * grain_len));
+//         Self {
+//             samples,
+//             grains,
+//             grain_len,
+//             smear: smear.clamp(0., 1.),
+//             speed,
+//         }
+//     }
+// }
+
+// impl<'a> Iterator for Grains<'a> {
+//     type Item = u8;
+
+//     fn next(&mut self) -> Option<u8> {
+//         if let Some(b) = self.grains.back() {
+//             let smear_len = (self.grain_len as f32 / self.speed * self.smear) as usize;
+//             if b.count() < smear_len {
+//                 let grain_end = b.end + self.grain_len;
+//                 let smear_end = b.end + (self.grain_len as f32 / self.speed) as usize + smear_len;
+//                 self.grains.push(Grain::new(&self.samples[b.end..smear_end], self.grain_len, grain_end));
+//             }
+//         }
+//         let mut g = self.grains.iter_mut();
+//         g.next_back().and_then(|b| b.take_mixed(g.next_back()))
+//     }
+// }
+
+struct Grain {
+    queue: VecDeque<u8>,
+    n: usize
+}
+
+impl Grain {
+    pub fn new(samples: &[u8], n: usize) -> Self {
+        Self {
+            queue: VecDeque::from(samples.to_vec()),
+            n
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    pub fn take(&mut self) -> Option<u8> {
+        self.queue.pop_front()
+    }
+}
+
 struct Grains<'a> {
     samples: &'a [u8],
-    zeroes_orig: VecDeque<usize>,
-    zeroes: VecDeque<usize>,
-    nth_grain: VecDeque<u8>,
+    grain: Grain,
+    grain_len: usize,
     speed: f32,
 }
 
 impl<'a> Grains<'a> {
-    pub fn new (samples: &'a [u8]) -> Self {
-        let zeroes = samples
-            .windows(2)
-            .flat_map(&<[u8; 2]>::try_from)
-            .enumerate()
-            .filter(|(_, [a, b])| Self::is_zero_crossing(a, b))
-            .filter(|(i, _)| i % 4 == 0)
-            .map(|(i, _)| i)
-            .collect::<VecDeque<_>>();
-        info!("zeroes len: {}", zeroes.len());
+    pub fn new(samples: &'a [u8], grain_len: usize, speed: f32) -> Self {
+        if grain_len == 0 {
+            crate::panic!("grain_len should be > 0");
+        }
         Self {
             samples,
-            zeroes_orig: zeroes.clone(),
-            zeroes, 
-            nth_grain: VecDeque::new(),
-            speed: 1.5,
+            grain: Grain::new(&[], 0),
+            grain_len,
+            speed,
         }
     }
+
     pub fn set_speed(&mut self, speed: f32) {
-        self.speed = speed;
+        self.speed = speed
     }
 
     fn is_zero_crossing(sample_a: &u8, sample_b: &u8) -> bool {
@@ -91,44 +205,72 @@ impl<'a> Iterator for Grains<'a> {
     type Item = u8;
 
     fn next(&mut self) -> Option<u8> {
-        while self.zeroes.len() + self.nth_grain.len() > 0 {
-            // next sample
-            if let Some(g) = self.nth_grain.pop_front() {
-                return Some(g);
-            }
+        // next grain
+        while self.grain.len() == 0 {
+            let n = self.grain.n() % (self.samples.len() / self.grain_len);
+            let start = n * self.grain_len;
 
-            // next grain
-            // TODO: fix irregular timestretch
-            // - check if due to while loop or algorithm
-            // -- try alternate impl using overall cursor and this_n instead of VecDeque
-            // TODO: impl speed = 0 (repeat grain)
-            if let Some(z) = self.zeroes.pop_front() {
-                if self.speed == 0. {
-                    crate::panic!("zero speed not implemented");
-                }
-                let n = ((self.zeroes.len() + 1) as f32 / self.speed) as usize -
-                    (self.zeroes.len() as f32 / self.speed) as usize;
+            // let end = if self.speed == 0. {
+            //     self.samples.get(start..)
+            //         .and_then(|s| s
+            //             .iter()
+            //             .tuple_windows::<(_, _)>()
+            //             .enumerate()
+            //             .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+            //             .map(|(i, _)| start + i)
+            //         ).unwrap_or(self.samples.len())
+            let grain_len = if self.speed == 0. {
+                self.grain_len
+            } else {
+                (self.grain_len as f32 / self.speed) as usize
+            };
 
-                info!("{}", self.samples[z]);
-                self.nth_grain = if let Some(&z_next) = self.zeroes.get(0) {
-                    VecDeque::from(self.samples[z..z_next].repeat(n))
-                } else {
-                    VecDeque::from(vec![self.samples[z]])
-                };
-            }
+            let upper = self.samples.get(start + grain_len..)
+                .and_then(|s| s
+                    .iter()
+                    .tuple_windows::<(_, _)>()
+                    .enumerate()
+                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+                    .map(|(i, _)| start + grain_len + i)
+                ).unwrap_or(self.samples.len());
+            let lower = self.samples.get(start..start + grain_len)
+                .and_then(|s| s
+                    .iter()
+                    .rev()
+                    .tuple_windows::<(_, _)>()
+                    .enumerate()
+                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+                    .map(|(i, _)| start + grain_len - i)
+                ).unwrap_or(upper);
+
+            let u_diff = (start + grain_len).abs_diff(upper);
+            let l_diff = (start + grain_len).abs_diff(lower);
+            let end = if u_diff < l_diff {
+                upper
+            } else {
+                lower
+            };
+
+            // let r = ((n + 1) as f32 / self.speed) as usize -
+            //      (n as f32 / self.speed) as usize;
+
+            self.grain = Grain::new(
+                &self.samples[start..end],
+                if self.speed == 0. { n } else { n + 1 }
+            );
         }
-        self.zeroes = self.zeroes_orig.clone();
-        Some(0)
+        // next sample
+        self.grain.take()
     }
 }
 
 trait SliceExt {
-    fn grains(&self) -> Grains<'_>;
+    fn grains(&self, grain_len: usize, speed: f32) -> Grains<'_>;
 }
 
 impl SliceExt for [u8] {
-    fn grains(&self) -> Grains<'_> {
-        Grains::new(self)
+    fn grains(&self, grain_len: usize, speed: f32) -> Grains<'_> {
+        Grains::new(self, grain_len, speed)
     }
 }
 
@@ -263,6 +405,7 @@ fn main() -> ! {
 
     let joy_c_pin = pins.gpio22.into_pull_up_input();
 
+    // within [0..4096]
     let mut joy_x = 0;
     let mut joy_y = 0;
     let mut joy_x_was = joy_x;
@@ -297,8 +440,6 @@ fn main() -> ! {
     let break_len = BREAK_BYTES[0x2c..].len();
     let steps_len = 16;
 
-    let mut inc = 0;
-
     info!("loop start!");
     loop {
         // sync inputs
@@ -319,23 +460,25 @@ fn main() -> ! {
             seq_downs[i] = seq_pins[i].is_low().unwrap();
         }
 
-        // if joy_x != joy_x_was {
-        //     critical_section::with(|cs| {
-        //         if GRAINS.borrow_ref(cs).is_some() {
-        //             GRAINS.
-        //                 borrow_ref_mut(cs)
-        //                 .as_mut()
-        //                 .expect("failed to take grains as mut")
-        //                 .
-        //         }
-        //     });
-        // }
-
-        if joy_c_down && inc > 4096 {
-            info!("joystick: ({}, {})", joy_x, joy_y);
-            inc = 0;
-        } else {
-            inc += 1;
+        if joy_x != joy_x_was {
+            let speed = if joy_x < 100 {
+                0.
+            } else if joy_x < 1900 {
+                libm::cbrtf(joy_x as f32 / 2047.)
+            } else if joy_x > 2080 {
+                2. * libm::cbrtf(joy_x as f32 / 2047. - 2.) + 3.
+            } else {
+                1.
+            };
+            critical_section::with(|cs| {
+                if GRAINS.borrow_ref(cs).is_some() {
+                    GRAINS.
+                        borrow_ref_mut(cs)
+                        .as_mut()
+                        .expect("failed to take grains as mut")
+                        .set_speed(speed);
+                }
+            });
         }
 
         // process sequencer
@@ -453,7 +596,7 @@ fn PWM_IRQ_WRAP() {
         if GRAINS.borrow_ref(cs).is_none() {
             GRAINS
                 .borrow_ref_mut(cs)
-                .replace(BREAK_BYTES[0x2c..].grains());
+                .replace(BREAK_BYTES[0x2c..].grains(1024, 1.));
         }
     });
     if let Some(pwm) = PWMOUT_SNGL {
@@ -467,6 +610,7 @@ fn PWM_IRQ_WRAP() {
             );
         });
         pwm.clear_interrupt();
+    }
         // critical_section::with(|cs| {
             // precalculate number grains
             // if GRAIN_N.borrow(cs).get().is_none() {
@@ -518,7 +662,6 @@ fn PWM_IRQ_WRAP() {
             //     );
             // }
         // });
-    }
 }
 
 // end of file
