@@ -6,30 +6,52 @@ use defmt_rtt as _;
 
 use panic_halt as _;
 
+use cortex_m::delay::Delay;
+
 use rp2040_hal as hal;
 
 use hal::clocks::{Clock, ClocksManager};
 use hal::gpio::{
     DynPinId,
+    FunctionSio,
     FunctionSioInput,
+    FunctionSpi,
     Pin,
+    PullDown,
+    PullNone,
     PullUp,
+    SioOutput,
 };
 use hal::pll::common_configs::PLL_USB_48MHZ;
 use hal::pll::PLLConfig;
 use hal::pwm;
+use hal::gpio::bank0::*;
+use hal::Spi;
+use hal::spi::Enabled;
 
 use hal::pac;
 use pac::interrupt;
+use pac::SPI1;
 
 use embedded_hal::digital::v2::InputPin;
 use embedded_hal::PwmPin;
+
+use embedded_sdmmc::{
+    File,
+    Mode,
+    SdCard,
+    TimeSource,
+    Timestamp,
+    VolumeIdx,
+    VolumeManager,
+};
 
 use fugit::{HertzU32, RateExtU32};
 
 use critical_section::Mutex;
 use core::cell::{Cell, RefCell};
 use alloc::collections::VecDeque;
+use alloc::vec;
 
 use itertools::Itertools;
 
@@ -47,103 +69,6 @@ enum SequencerTrans {
     Return,
     Resync,
 }
-
-// struct Grain<'a> {
-//     samples: &'a [u8],
-//     queue: VecDeque<u8>,
-//     len: usize,
-//     end: usize,
-// }
-
-// impl<'a> Grain<'a> {
-//     pub fn new(samples: &'a [u8], len: usize, end: usize) -> Self {
-//         let queue = VecDeque::from(samples.clone().to_vec());
-//         Self {
-//             samples,
-//             queue,
-//             len,
-//             end,
-//         }
-//     }
-
-//     pub fn count(&self) -> usize {
-//         self.queue.len()
-//     }
-
-//     pub fn len(&self) -> usize {
-//         self.len.min(self.samples.len())
-//     }
-
-//     pub fn take_raw(&mut self) -> Option<u8> {
-//         self.queue.pop_front()
-//     }
-
-//     pub fn take_mixed(&mut self, other: Option<&mut Grain>) -> Option<u8> {
-//         if let Some(s) = self.take_raw() {
-//             if let Some(other) = other {
-//                 if let Some(o) = other.take_raw() {
-//                     //                  pi(self.len()-self.queue.len())
-//                     // 1/2(o-s+(o-s)cos(-------------------------------))
-//                     //                  min(self.len(), other.len())
-//                     // Some(
-//                     //     ((o + s) as f32 + (o - s) as f32 * libm::cosf(
-//                     //         core::f32::consts::PI * (self.len() - self.count()) as f32 /
-//                     //             self.len().min(other.len()) as f32
-//                     //     )) as u8 / 2
-//                     // );
-//                     let s = s as f32;
-//                     let o = o as f32;
-//                     return Some((o + (o - s) / self.len().min(other.len()) as f32 * (self.len() as f32 - self.count() as f32)) as u8);
-//                 }
-//             }
-//             return Some(s);
-//         }
-//         None
-//         // self.take_raw()
-//     }
-// }
-
-// struct Grains<'a> {
-//     samples: &'a [u8],
-//     grains: ConstGenericRingBuffer<Grain<'a>, 2>,
-//     grain_len: usize,
-//     smear: f32,
-//     speed: f32,
-// }
-
-// impl<'a> Grains<'a> {
-//     pub fn new(samples: &'a [u8], grain_len: usize) -> Self {
-//         let speed = 1.;
-//         let mut smear = 1_f32;
-//         let mut grains = ConstGenericRingBuffer::new();
-//         grains.push(Grain::new(&samples[..grain_len], grain_len, grain_len));
-//         grains.push(Grain::new(&samples[grain_len..2 * grain_len], grain_len, 2 * grain_len));
-//         Self {
-//             samples,
-//             grains,
-//             grain_len,
-//             smear: smear.clamp(0., 1.),
-//             speed,
-//         }
-//     }
-// }
-
-// impl<'a> Iterator for Grains<'a> {
-//     type Item = u8;
-
-//     fn next(&mut self) -> Option<u8> {
-//         if let Some(b) = self.grains.back() {
-//             let smear_len = (self.grain_len as f32 / self.speed * self.smear) as usize;
-//             if b.count() < smear_len {
-//                 let grain_end = b.end + self.grain_len;
-//                 let smear_end = b.end + (self.grain_len as f32 / self.speed) as usize + smear_len;
-//                 self.grains.push(Grain::new(&self.samples[b.end..smear_end], self.grain_len, grain_end));
-//             }
-//         }
-//         let mut g = self.grains.iter_mut();
-//         g.next_back().and_then(|b| b.take_mixed(g.next_back()))
-//     }
-// }
 
 struct Grain {
     queue: VecDeque<u8>,
@@ -171,20 +96,30 @@ impl Grain {
     }
 }
 
+type SdBlockDevice = SdCard<Spi<Enabled, SPI1, (
+    Pin<Gpio11, FunctionSpi, PullNone>,
+    Pin<Gpio12, FunctionSpi, PullUp>,
+    Pin<Gpio10, FunctionSpi, PullNone>), 8>,
+    Pin<Gpio13, FunctionSio<SioOutput>, PullDown>,
+    Delay>;
+type SdVolManager = VolumeManager<SdBlockDevice, DummyTimesource, 4, 4, 1>;
+
 struct Grains<'a> {
-    samples: &'a [u8],
+    vol_mgr: &'a Mutex<RefCell<Option<SdVolManager>>>,
+    file: File,
     grain: Grain,
     grain_len: usize,
     speed: f32,
 }
 
 impl<'a> Grains<'a> {
-    pub fn new(samples: &'a [u8], grain_len: usize, speed: f32) -> Self {
+    pub fn new(vol_mgr: &'a Mutex<RefCell<Option<SdVolManager>>>, file: File, grain_len: usize, speed: f32) -> Self {
         if grain_len == 0 {
             crate::panic!("grain_len should be > 0");
         }
         Self {
-            samples,
+            vol_mgr,
+            file,
             grain: Grain::new(&[], 0),
             grain_len,
             speed,
@@ -196,20 +131,32 @@ impl<'a> Grains<'a> {
     }
 
     pub fn last_n(&self) -> usize {
-        self.samples.len() / self.grain_len
+        critical_section::with(|cs| {
+            if let Ok(l) = self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_length(self.file) {
+                (l as usize - 0x2c) / self.grain_len
+            } else {
+                0
+            }
+        })
     }
 
     fn is_zero_crossing(sample_a: &u8, sample_b: &u8) -> bool {
         (u8::MAX / 2).cmp(sample_a) != (u8::MAX / 2).cmp(sample_b)
     }
-}
 
-impl<'a> Iterator for Grains<'a> {
-    type Item = u8;
+    fn left(&self) -> u32 {
+        critical_section::with(|cs| {
+            self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_length(self.file).unwrap_or(0) -
+                self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_offset(self.file).unwrap_or(0)
+        })
+    }
 
-    fn next(&mut self) -> Option<u8> {
-        // next grain
+    fn iter_inner(&mut self, n: Option<usize>) -> Option<u8> {
+        if let Some(n) = n {
+            self.grain = Grain::new(&[], n % self.last_n());
+        }
         while self.grain.len() == 0 {
+            // next grain
             let n = self.grain.n() % self.last_n();
             let start = n * self.grain_len;
 
@@ -219,119 +166,90 @@ impl<'a> Iterator for Grains<'a> {
                 (self.grain_len as f32 / self.speed) as usize
             };
 
-            let upper = self.samples.get(start + grain_len..)
-                .and_then(|s| s
-                    .iter()
-                    .tuple_windows::<(_, _)>()
-                    .enumerate()
-                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
-                    .map(|(i, _)| start + grain_len + i)
-                ).unwrap_or(self.samples.len());
-            let lower = self.samples.get(start..start + grain_len)
-                .and_then(|s| s
+            critical_section::with(|cs| {
+                self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c + start as u32);
+            });
+
+            let l_len = grain_len.min(self.left() as usize);
+            let mut l_buffer = vec![0; l_len].into_boxed_slice();
+            critical_section::with(|cs| {
+                self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().read(self.file, &mut l_buffer);
+            });
+            let lower = l_buffer
                     .iter()
                     .rev()
                     .tuple_windows::<(_, _)>()
                     .enumerate()
                     .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
-                    .map(|(i, _)| start + grain_len - i)
-                ).unwrap_or(upper);
+                    .map(|(i, _)| l_len - i)
+                    .unwrap_or(l_len);
 
-            let u_diff = (start + grain_len).abs_diff(upper);
-            let l_diff = (start + grain_len).abs_diff(lower);
+            let u_len = grain_len.min(self.left() as usize);
+            let mut u_buffer = vec![0; u_len].into_boxed_slice();
+            critical_section::with(|cs| {
+                self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().read(self.file, &mut u_buffer);
+            });
+            let upper = u_buffer
+                    .iter()
+                    .tuple_windows::<(_, _)>()
+                    .enumerate()
+                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+                    .map(|(i, _)| u_len + i)
+                    .unwrap_or(u_len);
+
+            let u_diff = (u_len).abs_diff(upper);
+            let l_diff = (l_len).abs_diff(lower);
             let end = if u_diff < l_diff {
                 upper
             } else {
                 lower
             };
 
-            // let r = ((n + 1) as f32 / self.speed) as usize -
-            //      (n as f32 / self.speed) as usize;
+            let samples = [l_buffer, u_buffer].concat();
 
             self.grain = Grain::new(
-                &self.samples[start..end],
+                &samples[..end],
                 if self.speed == 0. { n } else { n + 1 }
             );
         }
         // next sample
         self.grain.take()
+    }
+}
+
+impl<'a> Iterator for Grains<'a> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        self.iter_inner(None)
     }
 
     fn nth(&mut self, n: usize) -> Option<u8> {
-        // next grain
-        let mut grain = Grain::new(&[], 0);
-        while grain.len() == 0 {
-            let n = n % (self.samples.len() / self.grain_len);
-            let start = n * self.grain_len;
+        self.iter_inner(Some(n))
+    }
+}
 
-            let grain_len = if self.speed == 0. {
-                self.grain_len
-            } else {
-                (self.grain_len as f32 / self.speed) as usize
-            };
+#[derive(Default)]
+pub struct DummyTimesource();
 
-            let upper = self.samples.get(start + grain_len..)
-                .and_then(|s| s
-                    .iter()
-                    .tuple_windows::<(_, _)>()
-                    .enumerate()
-                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
-                    .map(|(i, _)| start + grain_len + i)
-                ).unwrap_or(self.samples.len());
-            let lower = self.samples.get(start..start + grain_len)
-                .and_then(|s| s
-                    .iter()
-                    .rev()
-                    .tuple_windows::<(_, _)>()
-                    .enumerate()
-                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
-                    .map(|(i, _)| start + grain_len - i)
-                ).unwrap_or(upper);
-
-            let u_diff = (start + grain_len).abs_diff(upper);
-            let l_diff = (start + grain_len).abs_diff(lower);
-            let end = if u_diff < l_diff {
-                upper
-            } else {
-                lower
-            };
-
-            grain = Grain::new(
-                &self.samples[start..end],
-                if self.speed == 0. { n } else { n + 1 }
-            );
+impl TimeSource for DummyTimesource {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+            year_since_1970: 0,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
         }
-        self.grain = grain;
-        // next sample
-        self.grain.take()
     }
 }
 
-trait SliceExt {
-    fn grains(&self, grain_len: usize, speed: f32) -> Grains<'_>;
-}
-
-impl SliceExt for [u8] {
-    fn grains(&self, grain_len: usize, speed: f32) -> Grains<'_> {
-        Grains::new(self, grain_len, speed)
-    }
-}
-
-static BREAK_BYTES: &[u8] = include_bytes!("../assets/lc_mono8.wav");
 static GRAINS: Mutex<RefCell<Option<Grains>>> = Mutex::new(RefCell::new(None));
+static VOL_MGR: Mutex<RefCell<Option<SdVolManager>>> = Mutex::new(RefCell::new(None));
 
 static FREE_CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
 static MOD_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
-
-#[link_section = ".boot2"]
-#[used]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-extern crate alloc;
-use embedded_alloc::Heap;
-
-#[global_allocator]
-static HEAP: Heap = Heap::empty();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 // 110.25 MHz clock, multiple of 44.1 kHz sample rate
@@ -344,6 +262,16 @@ const PLL_SYS_110MHZ: PLLConfig = PLLConfig {
 
 type PwmOut = pwm::Slice<pwm::Pwm0, pwm::FreeRunning>;
 static PWMOUT: Mutex<RefCell<Option<PwmOut>>> = Mutex::new(RefCell::new(None));
+
+#[link_section = ".boot2"]
+#[used]
+pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+
+extern crate alloc;
+use embedded_alloc::Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
 
 #[rp2040_hal::entry]
 fn main() -> ! {
@@ -402,6 +330,61 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
+
+    // init spi
+    info!("init spi...");
+    let spi_sclk: Pin<_, FunctionSpi, PullNone> = pins.gpio10.reconfigure();
+    let spi_mosi: Pin<_, FunctionSpi, PullNone> = pins.gpio11.reconfigure();
+    let spi_miso: Pin<_, FunctionSpi, PullUp> = pins.gpio12.reconfigure();
+    let spi_cs = pins.gpio13.into_push_pull_output();
+
+    let spi = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI1, (spi_mosi, spi_miso, spi_sclk));
+
+    let spi = spi.init(
+        &mut pac.RESETS,
+        clocks.peripheral_clock.freq(),
+        400.kHz(),
+        embedded_hal::spi::MODE_0,
+    );
+
+    let sdcard = SdCard::new(spi, spi_cs, delay);
+    let mut vol_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
+
+    match vol_mgr.device().num_bytes() {
+        Ok(size) => info!("card size is {} bytes", size),
+        Err(e) => crate::panic!("failed to retrieve card size: {}", Debug2Format(&e)),
+    }
+    vol_mgr
+        .device()
+        .spi(|spi| spi.set_baudrate(clocks.peripheral_clock.freq(), 16.MHz()));
+
+    let volume = match vol_mgr.open_volume(VolumeIdx(0)) {
+        Ok(v) => v,
+        Err(e) => crate::panic!("failed to open volume 0: {}", Debug2Format(&e)),
+    };
+    let root_dir = match vol_mgr.open_root_dir(volume) {
+        Ok(d) => d,
+        Err(e) => crate::panic!("failed to open root directory: {}", Debug2Format(&e)),
+    };
+    let file = match vol_mgr.open_file_in_dir(root_dir, "lc_mono8.wav", Mode::ReadOnly) {
+        Ok(f) => f,
+        Err(e) => crate::panic!("failed to open file: {}", Debug2Format(&e)),
+    };
+
+    critical_section::with(|cs| {
+        VOL_MGR.borrow_ref_mut(cs).replace(vol_mgr);
+    });
+
+    critical_section::with(|cs| {
+        GRAINS
+            .borrow_ref_mut(cs)
+            .replace(Grains::new(
+                &VOL_MGR,
+                file,
+                1024,
+                1.
+            ));
+    });
 
     // init pwm
     info!("init pwm...");
@@ -477,7 +460,8 @@ fn main() -> ! {
     let mut seq_state: SequencerState = SequencerState::Free;
     let mut seq_trans: Option<SequencerTrans> = None;
 
-    let break_len = BREAK_BYTES[0x2c..].len();
+    let break_len = 16;
+    // let break_len = BREAK_BYTES[0x2c..].len();
     let steps_len = 16;
 
     info!("loop start!");
@@ -647,13 +631,6 @@ fn PWM_IRQ_WRAP() {
             *PWMOUT_SNGL = PWMOUT.borrow(cs).take();
         });
     }
-    critical_section::with(|cs| {
-        if GRAINS.borrow_ref(cs).is_none() {
-            GRAINS
-                .borrow_ref_mut(cs)
-                .replace(BREAK_BYTES[0x2c..].grains(1024, 1.));
-        }
-    });
     if let Some(pwm) = PWMOUT_SNGL {
         critical_section::with(|cs| {
             pwm.channel_a.set_duty(((GRAINS
@@ -666,57 +643,6 @@ fn PWM_IRQ_WRAP() {
         });
         pwm.clear_interrupt();
     }
-        // critical_section::with(|cs| {
-            // precalculate number grains
-            // if GRAIN_N.borrow(cs).get().is_none() {
-            //     let mut cursor = 0;
-            //     'l: loop {
-            //         GRAIN_N.borrow(cs).set(GRAIN_N.borrow(cs).get());
-            //         while !zero_crossed(0x2c + cursor) {
-            //             cursor += 1;
-            //             if cursor >= BREAK_BYTES.len() - 1 {
-            //                 break 'l
-            //             }
-            //         }
-            //     }
-            // }
-
-            // let cursor = MOD_CURSOR.borrow(cs).get().unwrap_or(
-            //     FREE_CURSOR.borrow(cs).get()
-            // );
-
-            // calculate current grain
-            // if zero_crossing(cursor) {
-                // GRAIN.borrow(cs).get_mut().start = cursor;
-                // GRAIN.borrow(cs).get_mut().end = cursor + 1;
-                // while !zero_crossing(0x2c + GRAIN.borrow(cs).get().end) {
-                    // GRAIN.borrow(cs).get_mut().end = GRAIN.borrow(cs).get().end;
-                // }
-            // }
-
-            // pwm.channel_a.set_duty(
-            //     ((BREAK_BYTES[0x2c + cursor] as u16) << 4) & 0xfff
-            // );
-            // pwm.channel_b.set_duty(
-            //     ((BREAK_BYTES[0x2c + cursor + 1] as u16) << 4) & 0xfff
-            // );
-            // FREE_CURSOR.borrow(cs).set((FREE_CURSOR.borrow(cs).get() + 2) % BREAK_BYTES[0x2c..].len());
-
-            // if cursor >= GRAIN.borrow(cs).get().end {
-            //     FREE_CURSOR.borrow(cs).set(GRAIN.borrow(cs).get().start);
-            // }
-            // if FREE_CURSOR.borrow(cs).get() >= GRAIN_END.borrow(cs).get() {
-            //         FREE_CURSOR.borrow(cs).set(GRAIN_START.borrow(cs).get());
-            //         GRAIN_N.borrow(cs).set(GRAIN_N.borrow(cs).get() + 1);
-
-            //         GRAIN_END.borrow(cs).set(usize::MAX);
-            // }
-            // if MOD_CURSOR.borrow(cs).get().is_some() {
-            //     MOD_CURSOR.borrow(cs).set(
-            //         Some((cursor + 2) % BREAK_BYTES[0x2c..].len())
-            //     );
-            // }
-        // });
 }
 
 // end of file
