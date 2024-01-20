@@ -52,6 +52,7 @@ use critical_section::Mutex;
 use core::cell::{Cell, RefCell};
 use alloc::collections::VecDeque;
 use alloc::vec;
+use alloc::boxed::Box;
 
 use itertools::Itertools;
 
@@ -72,27 +73,29 @@ enum SequencerTrans {
 
 struct Grain {
     queue: VecDeque<u8>,
-    n: usize
+    u_buffer: Box<[u8]>,
+    pub seek_to: Option<u32>,
 }
 
 impl Grain {
-    pub fn new(samples: &[u8], n: usize) -> Self {
+    pub fn new(samples: &[u8], u_buffer: Box<[u8]>) -> Self {
         Self {
             queue: VecDeque::from(samples.to_vec()),
-            n
+            u_buffer,
+            seek_to: None,
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
-
-    pub fn n(&self) -> usize {
-        self.n
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 
     pub fn take(&mut self) -> Option<u8> {
         self.queue.pop_front()
+    }
+
+    pub fn u_buffer(&self) -> Box<[u8]> {
+        self.u_buffer.clone()
     }
 }
 
@@ -120,7 +123,7 @@ impl<'a> Grains<'a> {
         Self {
             vol_mgr,
             file,
-            grain: Grain::new(&[], 0),
+            grain: Grain::new(&[], Box::new([])),
             grain_len,
             speed,
         }
@@ -130,13 +133,15 @@ impl<'a> Grains<'a> {
         self.speed = speed
     }
 
-    pub fn last_n(&self) -> usize {
+    pub fn seek_to(&mut self, pcm_index: u32) {
+        self.grain.seek_to = Some(pcm_index % self.pcm_len());
+        info!("seek_to: {}", pcm_index);
+    }
+
+    pub fn pcm_len(&self) -> u32 {
         critical_section::with(|cs| {
-            if let Ok(l) = self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_length(self.file) {
-                (l as usize - 0x2c) / self.grain_len
-            } else {
-                0
-            }
+            self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_length(self.file).unwrap() -
+                0x2c
         })
     }
 
@@ -150,31 +155,40 @@ impl<'a> Grains<'a> {
                 self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_offset(self.file).unwrap_or(0)
         })
     }
+}
 
-    fn iter_inner(&mut self, n: Option<usize>) -> Option<u8> {
-        if let Some(n) = n {
-            self.grain = Grain::new(&[], n % self.last_n());
-        }
-        while self.grain.len() == 0 {
-            // next grain
-            let n = self.grain.n() % self.last_n();
-            let start = n * self.grain_len;
+impl<'a> Iterator for Grains<'a> {
+    type Item = u8;
 
+    fn next(&mut self) -> Option<u8> {
+        // next grain
+        while self.grain.is_empty() {
+            if let Some(i) = self.grain.seek_to {
+                critical_section::with(|cs| {
+                    self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c + i);
+                });
+            }
+            critical_section::with(|cs| {
+                if self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_eof(self.file).unwrap() {
+                    self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c);
+                }
+            });
             let grain_len = if self.speed == 0. {
                 self.grain_len
             } else {
                 (self.grain_len as f32 / self.speed) as usize
             };
 
-            critical_section::with(|cs| {
-                self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c + start as u32);
-            });
-
             let l_len = grain_len.min(self.left() as usize);
-            let mut l_buffer = vec![0; l_len].into_boxed_slice();
-            critical_section::with(|cs| {
-                self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().read(self.file, &mut l_buffer);
-            });
+            let l_buffer = if self.grain.u_buffer().is_empty() {
+                let mut buf = vec![0; l_len].into_boxed_slice();
+                critical_section::with(|cs| {
+                    self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().read(self.file, &mut buf);
+                });
+                buf
+            } else {
+                self.grain.u_buffer()
+            };
             let lower = l_buffer
                     .iter()
                     .rev()
@@ -197,35 +211,23 @@ impl<'a> Grains<'a> {
                     .map(|(i, _)| u_len + i)
                     .unwrap_or(u_len);
 
-            let u_diff = (u_len).abs_diff(upper);
-            let l_diff = (l_len).abs_diff(lower);
+            let u_diff = (grain_len).abs_diff(upper);
+            let l_diff = (grain_len).abs_diff(lower);
             let end = if u_diff < l_diff {
                 upper
             } else {
                 lower
             };
 
-            let samples = [l_buffer, u_buffer].concat();
+            let samples = [l_buffer.clone(), u_buffer.clone()].concat();
 
             self.grain = Grain::new(
-                &samples[..end],
-                if self.speed == 0. { n } else { n + 1 }
+                samples.get(..end).unwrap_or(&[]),
+                if self.speed == 0. { l_buffer } else { u_buffer }
             );
         }
         // next sample
         self.grain.take()
-    }
-}
-
-impl<'a> Iterator for Grains<'a> {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<u8> {
-        self.iter_inner(None)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<u8> {
-        self.iter_inner(Some(n))
     }
 }
 
@@ -431,8 +433,6 @@ fn main() -> ! {
     // within [0..4096]
     let mut joy_x = 0;
     let mut joy_y = 0;
-    let mut joy_x_was = joy_x;
-    let mut joy_y_was = joy_y;
 
     // init sequencer
     info!("init sequencer buttons...");
@@ -467,6 +467,8 @@ fn main() -> ! {
     info!("loop start!");
     loop {
         // sync inputs
+        let joy_x_was = joy_x;
+        let joy_y_was = joy_y;
         if adc_fifo.len() > 1 {
             joy_x = adc_fifo.read();
             joy_y = adc_fifo.read();
@@ -539,15 +541,15 @@ fn main() -> ! {
         if !seq_vec.is_empty() && seq_vec_was.is_empty() {
             critical_section::with(|cs| {
                 if GRAINS.borrow_ref(cs).is_some() {
-                    let last_n = GRAINS
+                    let len = GRAINS
                         .borrow_ref(cs)
                         .as_ref()
-                        .map_or(0, |g| g.last_n());
+                        .map_or(0, |g| g.pcm_len());
                     GRAINS
                         .borrow_ref_mut(cs)
                         .as_mut()
                         .expect("failed to take grains as mut")
-                        .nth(last_n / 2);
+                        .seek_to(len / 2);
                 }
             });
         }
