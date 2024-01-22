@@ -49,7 +49,7 @@ use embedded_sdmmc::{
 use fugit::{HertzU32, RateExtU32};
 
 use critical_section::Mutex;
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::boxed::Box;
@@ -73,15 +73,15 @@ enum SequencerTrans {
 
 struct Grain {
     queue: VecDeque<u8>,
-    u_buffer: Box<[u8]>,
+    upper_buf: Box<[u8]>,
     pub seek_to: Option<u32>,
 }
 
 impl Grain {
-    pub fn new(samples: &[u8], u_buffer: Box<[u8]>) -> Self {
+    pub fn new(samples: &[u8], upper_buf: Box<[u8]>) -> Self {
         Self {
             queue: VecDeque::from(samples.to_vec()),
-            u_buffer,
+            upper_buf,
             seek_to: None,
         }
     }
@@ -94,8 +94,8 @@ impl Grain {
         self.queue.pop_front()
     }
 
-    pub fn u_buffer(&self) -> Box<[u8]> {
-        self.u_buffer.clone()
+    pub fn upper_buf(&self) -> Box<[u8]> {
+        self.upper_buf.clone()
     }
 }
 
@@ -160,73 +160,92 @@ impl<'a> Grains<'a> {
 impl<'a> Iterator for Grains<'a> {
     type Item = u8;
 
+    // TODO: investigate slow audio
+    // - likely due to vol_mgr.read() being slow
+    // TODO: fix crash
     fn next(&mut self) -> Option<u8> {
         // next grain
         while self.grain.is_empty() {
-            if let Some(i) = self.grain.seek_to {
-                critical_section::with(|cs| {
-                    self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c + i);
-                });
-            }
             critical_section::with(|cs| {
-                if self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_eof(self.file).unwrap() {
-                    self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c);
+                if let Some(i) = self.grain.seek_to {
+                    self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c + i);
                 }
+                if self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_offset(self.file).unwrap() < 0x2c ||
+                    self.vol_mgr.borrow_ref(cs).as_ref().unwrap().file_eof(self.file).unwrap()
+                {
+                    self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().file_seek_from_start(self.file, 0x2c);
+                };
             });
-            let grain_len = if self.speed == 0. {
-                self.grain_len
-            } else {
-                (self.grain_len as f32 / self.speed) as usize
-            };
 
-            let l_len = grain_len.min(self.left() as usize);
-            let l_buffer = if self.grain.u_buffer().is_empty() {
-                let mut buf = vec![0; l_len].into_boxed_slice();
+            let lower_buf = if self.grain.upper_buf().is_empty() {
+                info!("new lower buf!");
+                let mut buf = vec![
+                    0;
+                    self.grain_len.min(self.left() as usize)
+                ].into_boxed_slice();
                 critical_section::with(|cs| {
                     self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().read(self.file, &mut buf);
                 });
                 buf
             } else {
-                self.grain.u_buffer()
+                self.grain.upper_buf()
             };
-            let lower = l_buffer
-                    .iter()
-                    .rev()
-                    .tuple_windows::<(_, _)>()
-                    .enumerate()
-                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
-                    .map(|(i, _)| l_len - i)
-                    .unwrap_or(l_len);
+            let lower_xing = lower_buf
+                .iter()
+                .rev()
+                .tuple_windows::<(_, _)>()
+                .enumerate()
+                .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+                .map(|(i, _)| lower_buf.len() - i)
+                .unwrap_or(lower_buf.len());
 
-            let u_len = grain_len.min(self.left() as usize);
-            let mut u_buffer = vec![0; u_len].into_boxed_slice();
+            let mut upper_buf = vec![
+                0;
+                self.grain_len.min(self.left() as usize)
+            ].into_boxed_slice();
             critical_section::with(|cs| {
-                self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().read(self.file, &mut u_buffer);
+                self.vol_mgr.borrow_ref_mut(cs).as_mut().unwrap().read(self.file, &mut upper_buf);
             });
-            let upper = u_buffer
-                    .iter()
-                    .tuple_windows::<(_, _)>()
-                    .enumerate()
-                    .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
-                    .map(|(i, _)| u_len + i)
-                    .unwrap_or(u_len);
+            let upper_xing = upper_buf
+                .iter()
+                .tuple_windows::<(_, _)>()
+                .enumerate()
+                .find_or_last(|(_, (a, b))| Self::is_zero_crossing(a, b))
+                .map(|(i, _)| upper_buf.len() + i)
+                .unwrap_or(upper_buf.len());
 
-            let u_diff = (grain_len).abs_diff(upper);
-            let l_diff = (grain_len).abs_diff(lower);
-            let end = if u_diff < l_diff {
-                upper
+            let lower_diff = (lower_buf.len()).abs_diff(lower_xing);
+            let upper_diff = (upper_buf.len()).abs_diff(upper_xing);
+            let xing = if upper_diff < lower_diff {
+                upper_xing
             } else {
-                lower
+                lower_xing
             };
 
-            let samples = [l_buffer.clone(), u_buffer.clone()].concat();
+            let count = if self.speed == 0. {
+                1
+            } else {
+                ((self.left() as usize / self.grain_len + 1) as f32 / self.speed) as usize -
+                    ((self.left() as usize / self.grain_len) as f32 / self.speed) as usize
+            };
+
+            let samples = [lower_buf, upper_buf].concat();
+            let lower_samples = samples.get(..xing).unwrap_or(&[]);
+            let upper_samples = samples.get(xing..).unwrap_or(&[]);
+            let samples = lower_samples.repeat(count).into_boxed_slice();
+            // info!("left: {}, count: {}, s_len: {}, l_len: {}, u_len: {}",
+            //     self.left(),
+            //     count,
+            //     samples.len(),
+            //     lower_samples.len(),
+            //     upper_samples.len()
+            // );
 
             self.grain = Grain::new(
-                samples.get(..end).unwrap_or(&[]),
-                if self.speed == 0. { l_buffer } else { u_buffer }
+                &samples,
+                if self.speed == 0. { lower_samples.into() } else { upper_samples.into() }
             );
         }
-        // next sample
         self.grain.take()
     }
 }
@@ -249,9 +268,6 @@ impl TimeSource for DummyTimesource {
 
 static GRAINS: Mutex<RefCell<Option<Grains>>> = Mutex::new(RefCell::new(None));
 static VOL_MGR: Mutex<RefCell<Option<SdVolManager>>> = Mutex::new(RefCell::new(None));
-
-static FREE_CURSOR: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
-static MOD_CURSOR: Mutex<Cell<Option<usize>>> = Mutex::new(Cell::new(None));
 
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 // 110.25 MHz clock, multiple of 44.1 kHz sample rate
@@ -368,7 +384,7 @@ fn main() -> ! {
         Ok(d) => d,
         Err(e) => crate::panic!("failed to open root directory: {}", Debug2Format(&e)),
     };
-    let file = match vol_mgr.open_file_in_dir(root_dir, "lc_mono8.wav", Mode::ReadOnly) {
+    let file = match vol_mgr.open_file_in_dir(root_dir, "funkier.wav", Mode::ReadOnly) {
         Ok(f) => f,
         Err(e) => crate::panic!("failed to open file: {}", Debug2Format(&e)),
     };
@@ -424,72 +440,28 @@ fn main() -> ! {
     let mut adc_fifo = adc
         .build_fifo()
         .clock_divider(47999, 1)
-        .set_channel(&mut joy_x_pin)
-        .round_robin((&mut joy_y_pin, &mut joy_x_pin))
+        .round_robin((&mut joy_x_pin, &mut joy_y_pin))
         .start();
 
     let joy_c_pin = pins.gpio22.into_pull_up_input();
 
-    // within [0..4096]
-    let mut joy_x = 0;
-    let mut joy_y = 0;
-
-    // init sequencer
-    info!("init sequencer buttons...");
-    // sequencer state machine:
-    //     Free => Jump ..
-    //     Return* => Jump ..
-    //     Jump => Hold => Return => Free..
-    //     Jump => HoldR => ReturnR => Free..
-    //     once: Jump*, Return*
-    //     loop: Free, Hold*
-    let seq_pins: [Pin<DynPinId, FunctionSioInput, PullUp>; 8] = [
-        pins.gpio2.reconfigure().into_dyn_pin(),
-        pins.gpio3.reconfigure().into_dyn_pin(),
-        pins.gpio4.reconfigure().into_dyn_pin(),
-        pins.gpio5.reconfigure().into_dyn_pin(),
-        pins.gpio6.reconfigure().into_dyn_pin(),
-        pins.gpio7.reconfigure().into_dyn_pin(),
-        pins.gpio8.reconfigure().into_dyn_pin(),
-        pins.gpio9.reconfigure().into_dyn_pin(),
-    ];
-
-    let mut seq_downs = [false; 8];
-    let mut seq_vec = tinyvec::array_vec!([u8; 8]);
-
-    let mut seq_state: SequencerState = SequencerState::Free;
-    let mut seq_trans: Option<SequencerTrans> = None;
-
-    let break_len = 16;
-    // let break_len = BREAK_BYTES[0x2c..].len();
-    let steps_len = 16;
+    // within 0..4096
+    let (mut joy_x, mut joy_y) = (0, 0);
 
     info!("loop start!");
     loop {
         // sync inputs
-        let joy_x_was = joy_x;
-        let joy_y_was = joy_y;
+        let (joy_x_was, joy_y_was) = (joy_x, joy_y);
         if adc_fifo.len() > 1 {
             joy_x = adc_fifo.read();
             joy_y = adc_fifo.read();
         }
         let joy_c_down = joy_c_pin.is_low().unwrap();
 
-        // sync sequencer buttons
-        let seq_vec_was = seq_vec;
-        for i in 0..seq_pins.len() {
-            if seq_pins[i].is_low().unwrap() && !seq_vec.contains(&(i as u8)) {
-                seq_vec.push(i as u8);
-            } else if seq_pins[i].is_high().unwrap() && seq_vec.contains(&(i as u8)) {
-                seq_vec.retain(|&x| x != i as u8);
-            }
-            seq_downs[i] = seq_pins[i].is_low().unwrap();
-        }
-
         if joy_x != joy_x_was {
             let speed = if joy_x < 100 {
                 0.
-            } else if joy_x < 1900 {
+            } else if joy_x < 1000 {
                 libm::cbrtf(joy_x as f32 / 2047.)
             } else if joy_x > 2080 {
                 2. * libm::cbrtf(joy_x as f32 / 2047. - 2.) + 3.
@@ -497,129 +469,8 @@ fn main() -> ! {
                 1.
             };
             critical_section::with(|cs| {
-                if GRAINS.borrow_ref(cs).is_some() {
-                    GRAINS
-                        .borrow_ref_mut(cs)
-                        .as_mut()
-                        .expect("failed to take grains as mut")
-                        .set_speed(speed);
-                }
+                GRAINS.borrow_ref_mut(cs).as_mut().unwrap().set_speed(speed);
             });
-        }
-
-        // process sequencer
-        if seq_vec_was != seq_vec {
-            if let Some(&t) = seq_vec.first() {
-                if seq_vec.len() > 1  {
-                    // init retrig
-                    let to = break_len / steps_len * t as usize;
-
-                    let mut from = to;
-                    seq_downs.rotate_left(t as usize);
-                    for (i, &d) in seq_downs.iter().enumerate().skip(1) {
-                        if d {
-                            from += break_len / steps_len / 32 * 2usize.pow(i as u32);
-                        }
-                    }
-                    info!("input retrig to {} from {}!", to, from);
-                    seq_trans = Some(SequencerTrans::Trig { to, from });
-                } else if seq_vec_was.is_empty() {
-                    // init jump
-                    let to = break_len / steps_len * t as usize;
-
-                    match (&seq_state, &seq_trans) {
-                        (_, &Some(SequencerTrans::Trig { .. })) => (),
-                        // (&SequencerState::Hold { to: t }, _) if t == to => (),
-                        _ => {
-                            info!("input jump to {}!", to);
-                            seq_trans = Some(SequencerTrans::Jump { to });
-                        }
-                    }
-                }
-            }
-        } 
-        if !seq_vec.is_empty() && seq_vec_was.is_empty() {
-            critical_section::with(|cs| {
-                if GRAINS.borrow_ref(cs).is_some() {
-                    let len = GRAINS
-                        .borrow_ref(cs)
-                        .as_ref()
-                        .map_or(0, |g| g.pcm_len());
-                    GRAINS
-                        .borrow_ref_mut(cs)
-                        .as_mut()
-                        .expect("failed to take grains as mut")
-                        .seek_to(len / 2);
-                }
-            });
-        }
-
-        match (&seq_state, &seq_trans) {
-            (&SequencerState::Free, None) => (),
-            (_, &Some(SequencerTrans::Trig { mut to, mut from })) => critical_section::with(|cs| {
-                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len / 32) < 2 {
-                    if FREE_CURSOR.borrow(cs).get() > break_len / 2 {
-                        to += break_len / 2;
-                        from += break_len / 2;
-                    }
-                    info!("init retrig to {} from {}!", to, from);
-                    MOD_CURSOR.borrow(cs).set(Some(to));
-                    seq_state = SequencerState::Retrig { to, from };
-                    seq_trans = None;
-                }
-            }),
-            (_, &Some(SequencerTrans::Jump { mut to })) => critical_section::with(|cs| {
-                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len) < 2 {
-                    if FREE_CURSOR.borrow(cs).get() > break_len / 2 {
-                        to += break_len / 2;
-                    }
-                    info!("jump to {}!", to);
-                    MOD_CURSOR.borrow(cs).set(Some(to));
-                    seq_state = SequencerState::Hold { to };
-                    seq_trans = None;
-                }
-            }),
-            (&SequencerState::Retrig { to, from }, None) => {
-                if seq_vec.get(1).is_none() {
-                    info!("input return!");
-                    seq_trans = Some(SequencerTrans::Return);
-                } else {
-                    critical_section::with(|cs| {
-                        if let Some(cursor) = MOD_CURSOR.borrow(cs).get() {
-                            if cursor > from ||
-                                cursor < to &&
-                                cursor > (from + to) % break_len
-                            {
-                                info!("retrig to {} from {}!", to, from);
-                                MOD_CURSOR.borrow(cs).set(Some(to));
-                            }
-                        }
-                    });
-                }
-            }
-            (&SequencerState::Retrig { .. }, &Some(SequencerTrans::Return)) => critical_section::with(|cs| {
-                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len / 32) < 2 {
-                    info!("return from retrig!");
-                    MOD_CURSOR.borrow(cs).set(None);
-                    seq_state = SequencerState::Free;
-                    seq_trans = None;
-                }
-            }),
-            (&SequencerState::Hold { .. }, None) => {
-                if seq_vec.is_empty() {
-                    info!("input resync!");
-                    seq_trans = Some(SequencerTrans::Resync);
-                }
-            }
-            (&SequencerState::Hold { .. }, &Some(SequencerTrans::Resync)) => critical_section::with(|cs| {
-                if FREE_CURSOR.borrow(cs).get() % (break_len / steps_len) < 2 {
-                    info!("resync from jump!");
-                    MOD_CURSOR.borrow(cs).set(None);
-                    seq_state = SequencerState::Free;
-                    seq_trans = None;
-                }
-            }),
-            _ => (),
         }
     }
 }
